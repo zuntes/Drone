@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>drone_bringup</name>
+  <version>1.0.0</version>
+  <description>Launch files and shared configuration for the drone bridge system</description>
+  <maintainer email="dev@vtp.vn">VTP Robotics</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>telemetry_node</exec_depend>
+  <exec_depend>mqtt_bridge</exec_depend>
+  <exec_depend>drone_msgs</exec_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

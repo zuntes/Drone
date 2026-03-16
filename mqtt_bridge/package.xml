@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>mqtt_bridge</name>
+  <version>1.0.0</version>
+  <description>Bridges ROS2 drone_msgs to MQTT and MQTT task commands to ROS2. Pure transport.</description>
+  <maintainer email="dev@vtp.vn">VTP Robotics</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>drone_msgs</depend>
+  <exec_depend>python3-paho-mqtt</exec_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

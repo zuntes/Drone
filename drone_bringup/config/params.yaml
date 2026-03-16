@@ -1,0 +1,20 @@
+# ── drone identity ────────────────────────────────────────────────────────────
+# Used by mqtt_bridge_node only. telemetry_node is identity-agnostic.
+mqtt_bridge_node:
+  ros__parameters:
+    tenant_id:    "Hanoi"
+    drone_id:     "drone_01"
+    drone_serial: "SN000001"
+    mqtt_host:    "100.104.34.77"
+    mqtt_port:    1883
+    mqtt_username: ""
+    mqtt_password: ""
+    mqtt_tls:     false
+
+# ── publish rates ─────────────────────────────────────────────────────────────
+# Controlled by telemetry_node only. mqtt_bridge forwards whatever it receives.
+telemetry_node:
+  ros__parameters:
+    telemetry_rate_hz: 5.0    # /mqtt_bridge/out/telemetry
+    status_rate_hz:    1.0    # /mqtt_bridge/out/status
+    alarm_rate_hz:     0.2    # periodic floor (5s); changes publish immediately
