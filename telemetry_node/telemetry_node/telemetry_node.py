@@ -180,8 +180,6 @@ class TelemetryNode(Node):
 
     def _timer_telemetry(self) -> None:
         msg = telemetry_pub.build(self._store, self.get_clock())
-        if msg is None:
-            return
         self._pub_telemetry.publish(msg)
         self._pub_counts["telemetry"] += 1
 

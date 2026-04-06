@@ -97,6 +97,7 @@ def status(msg, alive: bool, bridge_uptime_s: float, session_key: str) -> dict:
     """
     return {
         "alive":              alive,
+        "ready":              msg.ready_for_flight,
         "bridge_uptime_s":    bridge_uptime_s,
         "session_key":        session_key,
         "px4_connected":      msg.px4_connected,
@@ -124,6 +125,11 @@ def alarm(msg) -> dict:
     b = msg.battery
     battery_payload = None
     if b.valid:
+        # `charge_cycles` exists in drone_msgs/BatteryState; convert NaN to None like other floats.
+        charge_cycles = None
+        if hasattr(b, "charge_cycles"):
+            charge_cycles = _f(b.charge_cycles)
+
         battery_payload = {
             "warning":           b.warning,
             "warning_label":     b.warning_label,
@@ -131,6 +137,7 @@ def alarm(msg) -> dict:
             "voltage_per_cell_v": _f(b.voltage_per_cell_v),
             "remaining_pct":     b.remaining_pct,
             "connected":         b.connected,
+            "charge_cycles":     charge_cycles,
         }
 
     g = msg.gps

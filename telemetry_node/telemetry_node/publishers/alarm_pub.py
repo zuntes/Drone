@@ -52,7 +52,7 @@ class AlarmState:
             bw = int(store.battery_status.warning)
             if bw != self.battery_warning:
                 if self.battery_warning is not None:
-                    logger.warning(f"🔋 Battery warning: {_BATT_WARN.get(bw, bw)}")
+                    logger.warning(f"Battery warning: {_BATT_WARN.get(bw, bw)}")
                 self.battery_warning = bw
                 changed = True
 
@@ -63,17 +63,17 @@ class AlarmState:
             ss = int(sg.spoofing_state)
             if hf != self.gps_has_fix:
                 if self.gps_has_fix is not None:
-                    logger.warning(f"📡 GPS fix: {'acquired' if hf else 'LOST'}")
+                    logger.warning(f"GPS fix: {'acquired' if hf else 'LOST'}")
                 self.gps_has_fix = hf
                 changed = True
             if js != self.gps_jamming_state:
                 if self.gps_jamming_state is not None and js not in (0, 1):
-                    logger.warning(f"📡 GPS jamming: {_JAMMING.get(js, js)}")
+                    logger.warning(f"GPS jamming: {_JAMMING.get(js, js)}")
                 self.gps_jamming_state = js
                 if js not in (0, 1): changed = True
             if ss != self.gps_spoofing_state:
                 if self.gps_spoofing_state is not None and ss not in (0, 1):
-                    logger.warning(f"📡 GPS spoofing: {_SPOOFING.get(ss, ss)}")
+                    logger.warning(f"GPS spoofing: {_SPOOFING.get(ss, ss)}")
                 self.gps_spoofing_state = ss
                 if ss not in (0, 1): changed = True
 
@@ -82,7 +82,7 @@ class AlarmState:
                               'cs_inertial_dead_reckoning', False))
             if dr != self.ekf_dead_reckoning:
                 if self.ekf_dead_reckoning is not None:
-                    logger.error(f"🧭 EKF dead reckoning: {'ACTIVE' if dr else 'cleared'}")
+                    logger.error(f"EKF dead reckoning: {'ACTIVE' if dr else 'cleared'}")
                 self.ekf_dead_reckoning = dr
                 changed = True
 
@@ -90,7 +90,7 @@ class AlarmState:
             ff = bool(store.vehicle_land_detected.freefall)
             if ff != self.freefall:
                 if self.freefall is not None:
-                    logger.error(f"🚨 FREEFALL: {'DETECTED' if ff else 'cleared'}")
+                    logger.error(f"FREEFALL: {'DETECTED' if ff else 'cleared'}")
                 self.freefall = ff
                 changed = True
 
@@ -133,6 +133,7 @@ def build(store: DroneDataStore, ros_clock) -> AlarmData:
         # Formula: remaining_pct = remaining * 100.0
         batt_msg.remaining_pct        = round(float(b.remaining)*100.0, 1)
         batt_msg.connected            = bool(b.connected)
+        batt_msg.charge_cycles        = int(b.charge_cycles) if hasattr(b, "charge_cycles") else _NAN
         batt_msg.valid                = True
     msg.battery = batt_msg
 

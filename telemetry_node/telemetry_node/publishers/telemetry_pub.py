@@ -41,20 +41,14 @@ _BATT_WARN_LABEL = {0:"none",1:"low",2:"critical",3:"emergency",4:"failed"}
 
 def build(store: DroneDataStore, ros_clock) -> TelemetryData:
     """
-    Build TelemetryData message from DroneDataStore.
-    Returns None if required PX4 topics haven't arrived yet.
+    Build TelemetryData from DroneDataStore. Always returns a message — never None.
+    Sub-fields use valid=False / NaN when their source topic has not arrived yet.
 
-    Required: vehicle_global_position, vehicle_local_position,
-              vehicle_attitude, vehicle_status, vehicle_land_detected
+    Position note: VehicleGlobalPosition.dead_reckoning=True means the EKF is
+    fusing without GPS. Coordinates are still published but position_current.valid
+    is set False so consumers know the fix is estimated only.
     """
-    if (store.vehicle_global_position is None
-            or store.vehicle_local_position is None
-            or store.vehicle_attitude is None
-            or store.vehicle_status is None
-            or store.vehicle_land_detected is None):
-        return None
-
-    msg = TelemetryData()
+    msg  = TelemetryData()
     msg.stamp = ros_clock.now().to_msg()
 
     gpos = store.vehicle_global_position
@@ -64,108 +58,136 @@ def build(store: DroneDataStore, ros_clock) -> TelemetryData:
     land = store.vehicle_land_detected
 
     # ── Flight mode ───────────────────────────────────────────────────────────
-    nav    = int(vs.nav_state)
-    arming = int(vs.arming_state)
-    msg.flight_mode = FlightMode(
-        armed        = (arming == 2),           # ARMING_STATE_ARMED = 2
-        in_air       = not bool(land.landed),
-        landed       = bool(land.landed),
-        flight_mode  = _NAV_STATE_LABELS.get(nav, f"mode_{nav}"),
-        control_mode = _control_mode_label(store.vehicle_control_mode, nav),
-    )
+    if vs is not None:
+        nav    = int(vs.nav_state)
+        arming = int(vs.arming_state)
+        msg.flight_mode = FlightMode(
+            armed        = (arming == 2),
+            in_air       = not bool(land.landed) if land is not None else False,
+            landed       = bool(land.landed)     if land is not None else True,
+            flight_mode  = _NAV_STATE_LABELS.get(nav, f"mode_{nav}"),
+            control_mode = _control_mode_label(store.vehicle_control_mode, nav),
+        )
+    else:
+        msg.flight_mode = FlightMode()
 
-    # ── Current position (EKF-fused) ──────────────────────────────────────────
-    lat = float(gpos.lat)
-    lon = float(gpos.lon)
-    msg.position_current = Position(lat=round(lat,7), lon=round(lon,7), valid=True)
+    # ── Current position ──────────────────────────────────────────────────────
+    # dead_reckoning=True → EKF running without GPS; position may drift.
+    # Still publish so the cloud always receives a message, but mark valid=False.
+    if gpos is not None:
+        lat = float(gpos.lat)
+        lon = float(gpos.lon)
+        msg.position_current = Position(
+            lat=round(lat, 7), lon=round(lon, 7),
+            valid=not bool(gpos.dead_reckoning),
+        )
+    else:
+        lat = lon = _NAN
+        msg.position_current = Position(valid=False)
 
     # ── Home position ─────────────────────────────────────────────────────────
     home = store.home_position
     if home is not None and bool(home.valid_hpos):
         hlat = float(home.lat)
         hlon = float(home.lon)
-        msg.position_home = Position(lat=round(hlat,7), lon=round(hlon,7), valid=True)
-        msg.alt_home      = float(home.alt) if bool(home.valid_alt) else _NAN
-        # Haversine: d = 2R·arcsin(√(sin²(Δlat/2)+cos(l1)·cos(l2)·sin²(Δlon/2)))
-        msg.dist_from_home_m = round(haversine_m(hlat, hlon, lat, lon), 2)
+        msg.position_home    = Position(lat=round(hlat, 7), lon=round(hlon, 7), valid=True)
+        msg.alt_home         = float(home.alt) if bool(home.valid_alt) else _NAN
+        msg.dist_from_home_m = (round(haversine_m(hlat, hlon, lat, lon), 2)
+                                if not math.isnan(lat) else _NAN)
     else:
         msg.position_home    = Position(valid=False)
         msg.alt_home         = _NAN
         msg.dist_from_home_m = _NAN
 
     # ── Altitude ──────────────────────────────────────────────────────────────
-    alt_amsl     = float(gpos.alt)
-    # alt_rel_home = -(NED_z)  because NED z is Down+
-    alt_rel_home = -float(lpos.z)
-    # AGL: rangefinder direct (best), terrain model (fallback), NaN if neither
-    if bool(lpos.dist_bottom_valid):
-        alt_rel_gnd = float(lpos.dist_bottom)           # rangefinder
-    elif bool(gpos.terrain_alt_valid):
-        alt_rel_gnd = alt_amsl - float(gpos.terrain_alt)  # terrain: agl = amsl - terrain_amsl
+    if lpos is not None:
+        # alt_rel_home = -(NED_z) because NED z is Down+
+        alt_rel_home = -float(lpos.z)
+        alt_amsl     = float(gpos.alt) if gpos is not None else _NAN
+        if bool(lpos.dist_bottom_valid):
+            alt_rel_gnd = float(lpos.dist_bottom)
+        elif gpos is not None and bool(gpos.terrain_alt_valid):
+            alt_rel_gnd = alt_amsl - float(gpos.terrain_alt)
+        else:
+            alt_rel_gnd = _NAN
+        msg.alt_current = Altitude(
+            alt_abs      = (round(alt_amsl, 3)    if not math.isnan(alt_amsl)    else _NAN),
+            alt_rel_home = round(alt_rel_home, 3),
+            alt_rel_gnd  = (round(alt_rel_gnd, 3) if not math.isnan(alt_rel_gnd) else _NAN),
+        )
+    elif gpos is not None:
+        msg.alt_current = Altitude(
+            alt_abs=round(float(gpos.alt), 3), alt_rel_home=_NAN, alt_rel_gnd=_NAN)
     else:
-        alt_rel_gnd = _NAN
-    msg.alt_current = Altitude(
-        alt_abs      = round(alt_amsl,     3),
-        alt_rel_home = round(alt_rel_home, 3),
-        alt_rel_gnd  = (round(alt_rel_gnd, 3) if not math.isnan(alt_rel_gnd) else _NAN),
-    )
+        msg.alt_current = Altitude(alt_abs=_NAN, alt_rel_home=_NAN, alt_rel_gnd=_NAN)
 
     # ── GPS health ────────────────────────────────────────────────────────────
     sgps = store.sensor_gps
     if sgps is not None:
-        fix_type = int(sgps.fix_type)
+        fix_type  = int(sgps.fix_type)
         ekf_fused = (get_ekf_gnss_fused(store.estimator_status_flags)
                      if store.estimator_status_flags else False)
         msg.gps = GpsHealth(
-            fix_type       = fix_type,
-            fix_label      = _FIX_LABELS.get(fix_type, f"unknown_{fix_type}"),
-            has_fix        = fix_type >= 3,
-            satellites_used= int(sgps.satellites_used),
-            quality_score  = _gps_quality(fix_type, int(sgps.satellites_used),
-                                          float(sgps.hdop), int(sgps.jamming_indicator),
-                                          ekf_fused),
-            hdop           = round(float(sgps.hdop), 3),
-            vdop           = round(float(sgps.vdop), 3),
-            valid          = True,
+            fix_type        = fix_type,
+            fix_label       = _FIX_LABELS.get(fix_type, f"unknown_{fix_type}"),
+            has_fix         = fix_type >= 3,
+            satellites_used = int(sgps.satellites_used),
+            quality_score   = _gps_quality(fix_type, int(sgps.satellites_used),
+                                           float(sgps.hdop), int(sgps.jamming_indicator),
+                                           ekf_fused),
+            hdop            = round(float(sgps.hdop), 3),
+            vdop            = round(float(sgps.vdop), 3),
+            valid           = True,
         )
     else:
         msg.gps = GpsHealth(valid=False)
 
     # ── Orientation from quaternion ───────────────────────────────────────────
-    # PX4 q=[w,x,y,z], NED→body rotation
-    w = float(att.q[0]); x = float(att.q[1])
-    y = float(att.q[2]); z = float(att.q[3])
-    roll_r, pitch_r, yaw_r = quat_to_euler(w, x, y, z)
-    tilt_r = quat_to_tilt(w, x, y, z)
-    # heading = (yaw_deg + 360) % 360 → [0, 360)
-    heading = (math.degrees(yaw_r) + 360.0) % 360.0
-    msg.orientation = Orientation(
-        roll_deg    = round(math.degrees(roll_r),  2),
-        pitch_deg   = round(math.degrees(pitch_r), 2),
-        yaw_deg     = round(math.degrees(yaw_r),   2),
-        heading_deg = round(heading,                2),
-        tilt_deg    = round(math.degrees(tilt_r),  2),
-    )
+    if att is not None:
+        # PX4 q=[w,x,y,z], NED→body rotation
+        w = float(att.q[0]); x = float(att.q[1])
+        y = float(att.q[2]); z = float(att.q[3])
+        roll_r, pitch_r, yaw_r = quat_to_euler(w, x, y, z)
+        tilt_r  = quat_to_tilt(w, x, y, z)
+        # heading = (yaw_deg + 360) % 360 → [0, 360)
+        heading = (math.degrees(yaw_r) + 360.0) % 360.0
+        msg.orientation = Orientation(
+            roll_deg    = round(math.degrees(roll_r),  2),
+            pitch_deg   = round(math.degrees(pitch_r), 2),
+            yaw_deg     = round(math.degrees(yaw_r),   2),
+            heading_deg = round(heading,                2),
+            tilt_deg    = round(math.degrees(tilt_r),  2),
+        )
+    else:
+        w = x = y = z = 0.0
+        heading = _NAN
+        msg.orientation = Orientation(
+            roll_deg=_NAN, pitch_deg=_NAN, yaw_deg=_NAN,
+            heading_deg=_NAN, tilt_deg=_NAN,
+        )
 
     # ── Velocity (body FRU via quaternion rotation from NED) ──────────────────
     # NED: vx=North+, vy=East+, vz=Down+
     # FRU: vx=Forward+, vy=Right+, vz=Up+ (negate NED z)
-    vx_f, vy_f, vz_f = ned_to_body_velocity(
-        float(lpos.vx), float(lpos.vy), float(lpos.vz), w, x, y, z)
-    msg.velocity = Velocity(
-        vx          = round(vx_f, 3),
-        vy          = round(vy_f, 3),
-        vz          = round(vz_f, 3),
-        heading_deg = round(heading, 2),
-    )
+    if lpos is not None and att is not None:
+        vx_f, vy_f, vz_f = ned_to_body_velocity(
+            float(lpos.vx), float(lpos.vy), float(lpos.vz), w, x, y, z)
+        msg.velocity = Velocity(
+            vx          = round(vx_f, 3),
+            vy          = round(vy_f, 3),
+            vz          = round(vz_f, 3),
+            heading_deg = round(heading, 2) if not math.isnan(heading) else _NAN,
+        )
+    else:
+        msg.velocity = Velocity(vx=_NAN, vy=_NAN, vz=_NAN, heading_deg=_NAN)
 
     # ── Battery ───────────────────────────────────────────────────────────────
     batt = store.battery_status
     if batt is not None:
         temp_k = float(batt.temperature)
-        # temp_c = temp_k - 273.15  (Kelvin to Celsius)
-        temp_c = (temp_k - 273.15) if not math.isnan(temp_k) else _NAN
-        tr = float(batt.time_remaining_s)
+        # temp_c = temp_k - 273.15 (Kelvin to Celsius)
+        temp_c   = (temp_k - 273.15) if not math.isnan(temp_k) else _NAN
+        tr       = float(batt.time_remaining_s)
         # time_remaining_min = time_remaining_s / 60.0
         time_rem = (tr / 60.0) if (not math.isnan(tr) and tr >= 0) else _NAN
         msg.battery = BatteryState(
@@ -174,7 +196,7 @@ def build(store: DroneDataStore, ros_clock) -> TelemetryData:
             current_a          = round(float(batt.current_a),  3),
             # remaining_pct = remaining * 100.0
             remaining_pct      = round(float(batt.remaining) * 100.0, 1),
-            temperature_c      = (round(temp_c, 2) if not math.isnan(temp_c) else _NAN),
+            temperature_c      = (round(temp_c, 2)   if not math.isnan(temp_c)   else _NAN),
             time_remaining_min = (round(time_rem, 1) if not math.isnan(time_rem) else _NAN),
             warning            = int(batt.warning),
             valid              = True,
