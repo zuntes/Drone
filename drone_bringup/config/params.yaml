@@ -5,14 +5,11 @@ mqtt_bridge_node:
     tenant_id:    "Hanoi"
     drone_id:     "drone_01"
     drone_serial: "SN000001"
-    # EMQX broker — fill in your cluster host/port from the EMQX dashboard
-    # Cloud/serverless: typically port 8883 with TLS
-    # Self-hosted:      typically port 1883 (plain) or 8883 (TLS)
-    mqtt_host:    "https://dev-lae-mqtt.viettelpost.vn"
-    mqtt_port:    8883
-    mqtt_username: "dungpt64"
-    mqtt_password: "v12345678"
-    mqtt_tls:     true
+    mqtt_host:    "100.104.34.77"
+    mqtt_port:    1883
+    mqtt_username: ""
+    mqtt_password: ""
+    mqtt_tls:     false
 
 # ── publish rates ─────────────────────────────────────────────────────────────
 # Controlled by telemetry_node only. mqtt_bridge forwards whatever it receives.
