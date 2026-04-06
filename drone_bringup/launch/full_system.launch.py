@@ -37,11 +37,7 @@ def generate_launch_description():
         DeclareLaunchArgument('mqtt_username',      default_value=''),
         DeclareLaunchArgument('mqtt_password',      default_value=''),
         DeclareLaunchArgument('mqtt_tls',           default_value='false'),
-        # DeclareLaunchArgument('mqtt_host',          default_value='dev-lae-mqtt.viettelpost.vn'),
-        # DeclareLaunchArgument('mqtt_port',          default_value='8883'),
-        # DeclareLaunchArgument('mqtt_username',      default_value='dungpt64'),
-        # DeclareLaunchArgument('mqtt_password',      default_value='v12345678'),
-        # DeclareLaunchArgument('mqtt_tls',           default_value='true'),
+
         # Publish rates (telemetry_node)
         DeclareLaunchArgument('telemetry_rate_hz',  default_value='5.0'),
         DeclareLaunchArgument('status_rate_hz',     default_value='1.0'),
