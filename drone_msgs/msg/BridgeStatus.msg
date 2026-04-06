@@ -5,6 +5,7 @@
 builtin_interfaces/Time stamp
 
 bool px4_connected             # true if PX4 message arrived in last 3 seconds
+bool ready_for_flight          # true if telemetry_node has received all data needed to compute flight duration
 string timesync_quality        # "excellent","good","degraded","poor","" if no data
 float32 timesync_rtt_ms        # PX4<->companion RTT. NaN if no data
 float32 flight_duration_s      # seconds airborne this leg (bridge-computed)

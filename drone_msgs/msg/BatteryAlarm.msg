@@ -11,4 +11,5 @@ float32 voltage_v
 float32 voltage_per_cell_v     # voltage_v / cell_count
 float32 remaining_pct
 bool connected
+float32 charge_cycles     # NaN if unknown
 bool valid
