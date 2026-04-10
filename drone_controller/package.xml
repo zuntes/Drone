@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>drone_controller</name>
+  <version>1.0.0</version>
+  <description>Executes MQTT task commands on the drone via PX4. PX4 v1.16.1.</description>
+  <maintainer email="dev@vtp.vn">VTP Robotics</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>px4_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>drone_msgs</depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

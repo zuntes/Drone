@@ -133,10 +133,10 @@ class TelemetryNode(Node):
             '/fmu/out/vehicle_global_position',
             store('vehicle_global_position'), q)
         self.create_subscription(VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position_v1',
+            '/fmu/out/vehicle_local_position',
             store('vehicle_local_position'), q)
         self.create_subscription(HomePosition,
-            '/fmu/out/home_position_v1',
+            '/fmu/out/home_position',
             store('home_position'), q)
         self.create_subscription(VehicleAttitude,
             '/fmu/out/vehicle_attitude',
@@ -148,10 +148,10 @@ class TelemetryNode(Node):
             '/fmu/out/estimator_status_flags',
             store('estimator_status_flags'), q)
         self.create_subscription(BatteryStatus,
-            '/fmu/out/battery_status_v1',
+            '/fmu/out/battery_status',
             store('battery_status'), q)
         self.create_subscription(VehicleStatus,
-            '/fmu/out/vehicle_status_v2',
+            '/fmu/out/vehicle_status_v1',
             store('vehicle_status'), q)
         self.create_subscription(VehicleLandDetected,
             '/fmu/out/vehicle_land_detected',
