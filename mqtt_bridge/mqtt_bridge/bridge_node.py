@@ -97,6 +97,8 @@ class MQTTBridgeNode(Node):
             username=p['mqtt_username'],
             password=p['mqtt_password'],
             use_tls=p['mqtt_tls'],
+            transport=p['mqtt_transport'],
+            ws_path=p['mqtt_ws_path'],
         )
         self._mqtt.connect()
 
@@ -395,18 +397,21 @@ class MQTTBridgeNode(Node):
 
     def _declare_params(self):
         self.declare_parameters(namespace='', parameters=[
-            ('tenant_id',    'default_tenant'),
-            ('drone_id',     'drone_01'),
-            ('drone_serial', 'SN000000'),
-            ('mqtt_host',    'localhost'),
-            ('mqtt_port',    1883),
-            ('mqtt_username',''),
-            ('mqtt_password',''),
-            ('mqtt_tls',     False),
+            ('tenant_id',       'default_tenant'),
+            ('drone_id',        'drone_01'),
+            ('drone_serial',    'SN000000'),
+            ('mqtt_host',       'localhost'),
+            ('mqtt_port',       1883),
+            ('mqtt_username',   ''),
+            ('mqtt_password',   ''),
+            ('mqtt_tls',        False),
+            ('mqtt_transport',  'tcp'),
+            ('mqtt_ws_path',    '/mqtt'),
         ])
 
     def _load_params(self) -> dict:
         return {k: self.get_parameter(k).value for k in [
             'tenant_id','drone_id','drone_serial',
             'mqtt_host','mqtt_port','mqtt_username','mqtt_password','mqtt_tls',
+            'mqtt_transport','mqtt_ws_path',
         ]}

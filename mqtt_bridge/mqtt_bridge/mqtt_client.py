@@ -8,12 +8,20 @@ Responsibilities:
   - LWT (Last Will Testament) provided by caller
   - Thread-safe: paho network thread + ROS2 callback thread
 
+Transport modes (set via mqtt_transport parameter):
+  - "tcp"        → raw MQTT over TCP (port 1883) or TLS (port 8883)
+  - "websockets" → MQTT over WebSocket (port 8083) or WSS (port 443/8084)
+
+Current deployment: wss://dev-lae-mqtt.viettelpost.vn:443/mqtt
+  Client → HAProxy (TLS on 443) → Kong → EMQX (ws:8083)
+
 Design: topic-agnostic. No drone_id, tenant_id, or message structure.
 All naming and semantics live in bridge_node.py.
 """
 
 import json
 import logging
+import ssl
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -35,14 +43,26 @@ class MQTTClient:
         username:           str  = "",
         password:           str  = "",
         use_tls:            bool = False,
+        transport:          str  = "tcp",
+        ws_path:            str  = "/mqtt",
         keepalive:          int  = 60,
         reconnect_delay_s:  float = 5.0,
     ):
+        # Sanitize host: strip protocol prefix if present
+        host = host.strip()
+        for prefix in ("https://", "http://", "wss://", "ws://",
+                       "mqtts://", "mqtt://"):
+            if host.startswith(prefix):
+                host = host[len(prefix):]
+        host = host.rstrip("/")
+
         self._host             = host
         self._port             = port
         self._username         = username
         self._password         = password
         self._use_tls          = use_tls
+        self._transport        = transport
+        self._ws_path          = ws_path
         self._keepalive        = keepalive
         self._reconnect_delay  = reconnect_delay_s
         self._lwt_topic        = lwt_topic
@@ -59,8 +79,9 @@ class MQTTClient:
 
         self._client = mqtt.Client(
             client_id=client_id,
-            protocol=mqtt.MQTTv311,
-            clean_session=True,
+            protocol=mqtt.MQTTv5,
+            transport=self._transport,
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         )
         self._configure_client()
 
@@ -69,8 +90,28 @@ class MQTTClient:
     def _configure_client(self) -> None:
         if self._username:
             self._client.username_pw_set(self._username, self._password)
+
+        # WebSocket path (required for MQTT over WebSocket)
+        if self._transport == "websockets":
+            self._client.ws_set_options(path=self._ws_path)
+
+        # TLS setup
         if self._use_tls:
-            self._client.tls_set()
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            try:
+                import certifi
+                ctx.load_verify_locations(certifi.where())
+                logger.info(f"TLS: CA from certifi")
+            except ImportError:
+                try:
+                    ctx.load_default_certs()
+                    logger.info(f"TLS: system CA")
+                except Exception:
+                    logger.warning("TLS: no CA found, disabling verification")
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+            self._client.tls_set_context(ctx)
 
         if self._lwt_topic and self._lwt_payload:
             self._client.will_set(
@@ -148,10 +189,15 @@ class MQTTClient:
     # ── Connection management ─────────────────────────────────────────────────
 
     def _start_connection(self) -> None:
+        _mode = f"{self._transport}"
+        if self._use_tls:
+            _mode = f"wss" if self._transport == "websockets" else "ssl"
+        _path = self._ws_path if self._transport == "websockets" else ""
+        logger.info(f"MQTT connecting: {_mode}://{self._host}:{self._port}{_path}")
+
         try:
             self._client.connect(self._host, self._port, self._keepalive)
             self._client.loop_start()
-            logger.info(f"MQTT connecting to {self._host}:{self._port}...")
         except (ConnectionRefusedError, OSError) as e:
             logger.warning(f"MQTT initial connect failed ({e}). Retrying...")
             self._client.loop_start()
@@ -177,26 +223,26 @@ class MQTTClient:
 
     # ── Paho callbacks ────────────────────────────────────────────────────────
 
-    def _on_connect(self, client, userdata, flags, rc: int) -> None:
-        if rc == 0:
+    def _on_connect(self, client, userdata, flags, rc, properties=None) -> None:
+        if rc == 0 or (hasattr(rc, 'value') and rc.value == 0):
             with self._lock:
                 self._connected = True
             logger.info(f"MQTT connected to {self._host}:{self._port}")
-            # Re-subscribe to all registered topics (handles reconnect case)
             for topic, qos, _ in self._subscriptions:
                 self._client.subscribe(topic, qos)
                 logger.info(f"MQTT subscribed: {topic} (QoS {qos})")
         else:
-            _err = {1:"bad protocol",2:"bad client id",3:"unavailable",
-                    4:"bad credentials",5:"not authorized"}
-            logger.error(f"MQTT connect refused: {_err.get(rc, f'rc={rc}')}")
-            if rc not in (4, 5):
+            logger.error(f"MQTT connect refused: {rc}")
+            # Don't reconnect on auth errors
+            rc_val = rc.value if hasattr(rc, 'value') else rc
+            if rc_val not in (4, 5, 134, 135):
                 self._start_reconnect_loop()
 
-    def _on_disconnect(self, client, userdata, rc: int) -> None:
+    def _on_disconnect(self, client, userdata, flags, rc, properties=None) -> None:
         with self._lock:
             self._connected = False
-        if rc == 0:
+        rc_val = rc.value if hasattr(rc, 'value') else rc
+        if rc_val == 0:
             logger.info("MQTT disconnected cleanly.")
         else:
             logger.warning(f"MQTT unexpected disconnect rc={rc}, reconnecting...")
@@ -216,7 +262,7 @@ class MQTTClient:
                 return
         logger.warning(f"MQTT message on unhandled topic: {topic}")
 
-    def _on_publish(self, client, userdata, mid: int) -> None:
+    def _on_publish(self, client, userdata, mid, rc=None, properties=None) -> None:
         logger.debug(f"MQTT ack mid={mid}")
 
 

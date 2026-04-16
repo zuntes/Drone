@@ -32,11 +32,13 @@ def generate_launch_description():
         DeclareLaunchArgument('drone_id',           default_value='drone_01'),
         DeclareLaunchArgument('drone_serial',       default_value='SN000001'),
         # MQTT connection (mqtt_bridge_node)
-        DeclareLaunchArgument('mqtt_host',          default_value='100.104.34.77'),
-        DeclareLaunchArgument('mqtt_port',          default_value='1883'),
-        DeclareLaunchArgument('mqtt_username',      default_value=''),
-        DeclareLaunchArgument('mqtt_password',      default_value=''),
-        DeclareLaunchArgument('mqtt_tls',           default_value='false'),
+        DeclareLaunchArgument('mqtt_host',          default_value='dev-lae-mqtt.viettelpost.vn'),
+        DeclareLaunchArgument('mqtt_port',          default_value='443'),
+        DeclareLaunchArgument('mqtt_username',      default_value='dungpt64'),
+        DeclareLaunchArgument('mqtt_password',      default_value='********'),
+        DeclareLaunchArgument('mqtt_tls',           default_value='true'),
+        DeclareLaunchArgument('mqtt_transport',     default_value='websockets'),
+        DeclareLaunchArgument('mqtt_ws_path',       default_value='/mqtt'),
 
         # Publish rates (telemetry_node)
         DeclareLaunchArgument('telemetry_rate_hz',  default_value='5.0'),
@@ -75,6 +77,8 @@ def generate_launch_description():
                 'mqtt_username':LaunchConfiguration('mqtt_username'),
                 'mqtt_password':LaunchConfiguration('mqtt_password'),
                 'mqtt_tls':     LaunchConfiguration('mqtt_tls'),
+                'mqtt_transport':LaunchConfiguration('mqtt_transport'),
+                'mqtt_ws_path': LaunchConfiguration('mqtt_ws_path'),
             },
         ],
     )
