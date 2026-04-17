@@ -12,9 +12,6 @@ Transport modes (set via mqtt_transport parameter):
   - "tcp"        → raw MQTT over TCP (port 1883) or TLS (port 8883)
   - "websockets" → MQTT over WebSocket (port 8083) or WSS (port 443/8084)
 
-Current deployment: wss://dev-lae-mqtt.viettelpost.vn:443/mqtt
-  Client → HAProxy (TLS on 443) → Kong → EMQX (ws:8083)
-
 Design: topic-agnostic. No drone_id, tenant_id, or message structure.
 All naming and semantics live in bridge_node.py.
 """

@@ -37,6 +37,11 @@ def telemetry(msg) -> dict:
     battery = None
     if msg.battery.valid:
         _BATT_WARN = {0:"none",1:"low",2:"critical",3:"emergency",4:"failed"}
+        
+        charge_cycles = None
+        if hasattr(msg.battery, "charge_cycles"):
+            charge_cycles = _f(msg.battery.charge_cycles)
+            
         battery = {
             "connected":          msg.battery.connected,
             "voltage_v":          msg.battery.voltage_v,
@@ -44,15 +49,16 @@ def telemetry(msg) -> dict:
             "remaining_pct":      msg.battery.remaining_pct,
             "temperature_c":      _f(msg.battery.temperature_c),
             "time_remaining_min": _f(msg.battery.time_remaining_min),
+            "charge_cycles":     charge_cycles,
             "warning":            msg.battery.warning,
             "warning_label":      _BATT_WARN.get(msg.battery.warning, "unknown"),
         }
 
     return {
         "flight_mode": {
-            "armed":        msg.flight_mode.armed,
-            "in_air":       msg.flight_mode.in_air,
-            "landed":       msg.flight_mode.landed,
+            # "armed":        msg.flight_mode.armed,
+            # "in_air":       msg.flight_mode.in_air,
+            # "landed":       msg.flight_mode.landed,
             "flight_mode":  msg.flight_mode.flight_mode,
             "control_mode": msg.flight_mode.control_mode,
         },
@@ -89,21 +95,17 @@ def telemetry(msg) -> dict:
     }
 
 
-def status(msg, alive: bool, bridge_uptime_s: float, session_key: str) -> dict:
-    """
-    drone_msgs/BridgeStatus → MQTT payload dict.
-    Bridge-side fields (alive, uptime, session_key) are added here
-    because they are not known by telemetry_node.
-    """
+def status_block(msg, flight_mode, ros_connected: bool) -> dict:
+    """BridgeStatus + FlightMode → status sub-dict for combined telemetry."""
     return {
-        "alive":              alive,
-        "ready":              msg.ready_for_flight,
-        "bridge_uptime_s":    bridge_uptime_s,
-        "session_key":        session_key,
-        "px4_connected":      msg.px4_connected,
-        "timesync_quality":   msg.timesync_quality if msg.timesync_valid else None,
-        "timesync_rtt_ms":    _f(msg.timesync_rtt_ms),
-        "flight_duration_s":  msg.flight_duration_s,
+        "ready_for_flight":          msg.ready_for_flight,
+        "armed":                     flight_mode.armed,
+        "landed":                    flight_mode.landed,
+        "in_air":                    flight_mode.in_air,
+        "ros_connected":             ros_connected,
+        "hardware_connected":        msg.px4_connected,
+        "hardware_timesync_quality": msg.timesync_quality if msg.timesync_valid else None,
+        "flight_duration_s":         msg.flight_duration_s,
     }
 
 
@@ -125,19 +127,11 @@ def alarm(msg) -> dict:
     b = msg.battery
     battery_payload = None
     if b.valid:
-        # `charge_cycles` exists in drone_msgs/BatteryState; convert NaN to None like other floats.
-        charge_cycles = None
-        if hasattr(b, "charge_cycles"):
-            charge_cycles = _f(b.charge_cycles)
-
         battery_payload = {
             "warning":           b.warning,
             "warning_label":     b.warning_label,
-            "voltage_v":         b.voltage_v,
-            "voltage_per_cell_v": _f(b.voltage_per_cell_v),
             "remaining_pct":     b.remaining_pct,
             "connected":         b.connected,
-            "charge_cycles":     charge_cycles,
         }
 
     g = msg.gps

@@ -4,19 +4,17 @@ MQTTBridgeNode — pure transport between ROS2 typed messages and MQTT.
 Knows about: MQTT, tenant_id, drone_id, envelope format, JSON serialization.
 Does NOT know about: PX4, DDS, sensor math.
 
-Outbound (ROS2 → MQTT):
-  /mqtt_bridge/in/telemetry  drone_msgs/TelemetryData → drone/{t}/{id}/telemetry  QoS 0
-  /mqtt_bridge/in/status     drone_msgs/BridgeStatus  → drone/{t}/{id}/status     QoS 1 retain
-  /mqtt_bridge/in/alarm      drone_msgs/AlarmData     → drone/{t}/{id}/alarm      QoS 1 retain
+Outbound (ROS2 → MQTT) — two topics only:
+  drone/{t}/{id}/ack         QoS 1 retained  — liveness heartbeat (1 Hz) + LWT
+  drone/{t}/{id}/telemetry   QoS 0           — combined: status + alarm + telemetry + task_status
 
 Inbound (MQTT → ROS2):
-  drone/{t}/{id}/task_command → validate → /mqtt_bridge/in/task_command  drone_msgs/TaskCommand
-  /mqtt_bridge/in/task_status drone_msgs/TaskStatus → drone/{t}/{id}/task_status  QoS 1
+  drone/{t}/{id}/task_command → validate → /mqtt_bridge/out/task_command  drone_msgs/TaskCommand
 
 Header envelope added to every MQTT message:
   {
     "header": { "tenant_id", "drone_id", "drone_serial", "type", "timestamp" },
-    "payload": { ...serialized from drone_msgs... }
+    "payload": { ... }
   }
 """
 
@@ -24,6 +22,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
@@ -69,30 +68,33 @@ class MQTTBridgeNode(Node):
         # Track last seen task_id to handle MQTT QoS-1 duplicate delivery
         self._last_task_id: str = ""
 
-        # MQTT topic paths
-        _base = f"drone/{self._tenant_id}/{self._drone_id}"
-        self._t_telemetry    = f"{_base}/telemetry"
-        self._t_status       = f"{_base}/status"
-        self._t_alarm        = f"{_base}/alarm"
-        self._t_task_command = f"{_base}/task_command"
-        self._t_task_status  = f"{_base}/task_status"
+        # Cached latest ROS2 messages for combined telemetry publish
+        self._last_status:      Optional[BridgeStatus] = None
+        self._last_alarm:       Optional[AlarmData]     = None
+        self._last_task_status: Optional[TaskStatus]    = None
 
-        self._pub_counts = {"telemetry":0,"status":0,"alarm":0,"task_status":0}
+        # MQTT topic paths — two outbound + one inbound
+        _base = f"drone/{self._tenant_id}/{self._drone_serial}"
+        self._t_ack          = f"{_base}/ack"
+        self._t_telemetry    = f"{_base}/telemetry"
+        self._t_task_command = f"{_base}/task_command"
+
+        self._pub_counts = {"telemetry": 0, "ack": 0}
 
         # ── MQTT client ───────────────────────────────────────────────────────
         _lwt = {
-            "header":  self._make_header("status"),
+            "metadata":  self._make_header("ack"),
             "payload": {
-                "alive":       False,
-                "session_key": self._session_key,
-                "reason":      "unexpected_disconnect",
+                "alive":          False,
+                "session_key":    self._session_key,
+                "bridge_uptime_s": 0.0,
             },
         }
         self._mqtt = MQTTClient(
             host=p['mqtt_host'],
             port=p['mqtt_port'],
             client_id=f"mqtt_bridge_{self._drone_id}_{int(time.time())}",
-            lwt_topic=self._t_status,
+            lwt_topic=self._t_ack,
             lwt_payload=_lwt,
             username=p['mqtt_username'],
             password=p['mqtt_password'],
@@ -102,7 +104,7 @@ class MQTTBridgeNode(Node):
         )
         self._mqtt.connect()
 
-        # ── ROS2 subscriptions (outbound: telemetry_node → MQTT) ──────────────
+        # ── ROS2 subscriptions (cached for combined outbound telemetry) ──────
         self.create_subscription(
             TelemetryData, '/mqtt_bridge/in/telemetry',
             self._cb_telemetry, _BEST_EFFORT)
@@ -112,8 +114,6 @@ class MQTTBridgeNode(Node):
         self.create_subscription(
             AlarmData, '/mqtt_bridge/in/alarm',
             self._cb_alarm, _RELIABLE)
-
-        # ── ROS2 subscription (inbound: mission_executor → MQTT) ──────────────
         self.create_subscription(
             TaskStatus, '/mqtt_bridge/in/task_status',
             self._cb_task_status, _RELIABLE)
@@ -123,11 +123,11 @@ class MQTTBridgeNode(Node):
             TaskCommand, '/mqtt_bridge/out/task_command', _RELIABLE)
 
         # ── Subscribe to MQTT task_command topic ──────────────────────────────
-        # Done via MQTTClient callback after connection is established
         self._mqtt.subscribe(self._t_task_command, qos=1,
                              callback=self._on_mqtt_task_command)
 
-        # ── Diagnostics timer ─────────────────────────────────────────────────
+        # ── Timers ────────────────────────────────────────────────────────────
+        self.create_timer(1.0, self._timer_ack)
         self.create_timer(30.0, self._timer_stats)
 
         self.get_logger().info(
@@ -136,156 +136,129 @@ class MQTTBridgeNode(Node):
             f"  Identity: {self._tenant_id} / {self._drone_id} ({self._drone_serial})\n"
             f"  Session:  {self._session_key}\n"
             f"  Outbound (ROS2 → MQTT):\n"
-            f"    TelemetryData → {self._t_telemetry}\n"
-            f"    BridgeStatus  → {self._t_status}\n"
-            f"    AlarmData     → {self._t_alarm}\n"
-            f"    TaskStatus    → {self._t_task_status}\n"
+            f"    ack        → {self._t_ack}  (QoS 1, retained, 1 Hz)\n"
+            f"    telemetry  → {self._t_telemetry}  (QoS 0, 5 Hz combined)\n"
             f"  Inbound (MQTT → ROS2):\n"
             f"    {self._t_task_command} → /mqtt_bridge/out/task_command\n"
             f"{'='*60}"
         )
 
-    # ── Outbound callbacks (ROS2 → MQTT) ─────────────────────────────────────
+    # ── Outbound: combined telemetry (ROS2 → MQTT) ──────────────────────────
 
     def _cb_telemetry(self, msg: TelemetryData) -> None:
-        """Serialize TelemetryData → JSON → MQTT. QoS 0: high-rate, drop on disconnect."""
-        payload = serializers.telemetry(msg)
-        envelope = {"header": self._make_header("telemetry"), "payload": payload}
+        ros_connected = self._last_status is not None
+        payload = {
+            "status":      serializers.status_block(self._last_status, msg.flight_mode, ros_connected)
+                           if self._last_status else None,
+            "alarm":       serializers.alarm(self._last_alarm)
+                           if self._last_alarm else None,
+            "telemetry":   serializers.telemetry(msg),
+            "task_status": serializers.task_status(self._last_task_status)
+                           if self._last_task_status else None,
+        }
+        envelope = {"metadata": self._make_header("telemetry"), "payload": payload}
         if self._mqtt.publish(self._t_telemetry, envelope, qos=0):
             self._pub_counts["telemetry"] += 1
 
     def _cb_status(self, msg: BridgeStatus) -> None:
-        """
-        Serialize BridgeStatus → JSON → MQTT.
-        Merges PX4-side data (from telemetry_node) with bridge-side data (alive, uptime).
-        QoS 1 retained: new MQTT subscribers immediately see bridge state.
-        """
-        payload = serializers.status(
-            msg,
-            alive=True,
-            bridge_uptime_s=round(time.time() - self._start_time, 1),
-            session_key=self._session_key,
-        )
-        envelope = {"header": self._make_header("status"), "payload": payload}
-        if self._mqtt.publish(self._t_status, envelope, qos=1, retain=True):
-            self._pub_counts["status"] += 1
+        self._last_status = msg
 
     def _cb_alarm(self, msg: AlarmData) -> None:
-        """Serialize AlarmData → JSON → MQTT. QoS 1 retained: always visible."""
-        payload = serializers.alarm(msg)
-        envelope = {"header": self._make_header("alarm"), "payload": payload}
-        if self._mqtt.publish(self._t_alarm, envelope, qos=1, retain=True):
-            self._pub_counts["alarm"] += 1
+        self._last_alarm = msg
 
     def _cb_task_status(self, msg: TaskStatus) -> None:
-        """Forward TaskStatus from mission_executor to MQTT."""
-        payload = serializers.task_status(msg)
-        envelope = {"header": self._make_header("task_status"), "payload": payload}
-        if self._mqtt.publish(self._t_task_status, envelope, qos=1):
-            self._pub_counts["task_status"] += 1
+        self._last_task_status = msg
+
+    # ── Outbound: ack heartbeat ──────────────────────────────────────────────
+
+    def _publish_ack(self, alive: bool) -> None:
+        envelope = {
+            "metadata": self._make_header("ack"),
+            "payload": {
+                "alive":          alive,
+                "session_key":    self._session_key,
+                "bridge_uptime_s": round(time.time() - self._start_time, 1),
+            },
+        }
+        if self._mqtt.publish(self._t_ack, envelope, qos=1, retain=True):
+            self._pub_counts["ack"] += 1
+
+    def _timer_ack(self) -> None:
+        self._publish_ack(alive=True)
 
     # ── Inbound callback (MQTT → ROS2) ────────────────────────────────────────
 
     def _on_mqtt_task_command(self, topic: str, raw: str) -> None:
-        """
-        Receive task_command from MQTT, validate, publish to ROS2.
-
-        Validation:
-          1. Valid JSON
-          2. Required fields present: header.task_id, header.drone_id, commands[]
-          3. drone_id matches this bridge's configured drone_id
-          4. commands[] is non-empty
-          5. Duplicate task_id check (MQTT QoS-1 can deliver twice)
-
-        On validation failure: publish REJECTED status to MQTT.
-        On success: publish RECEIVED status + forward to ROS2.
-        """
-        # Step 1: Parse JSON
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
             logger.error(f"task_command: invalid JSON: {e}")
-            self._publish_rejection("unknown", f"invalid_json: {e}")
             return
 
-        header   = data.get("header", {})
+        header   = data.get("metadata", {})
         task_id  = header.get("task_id", "")
         tenant_id = header.get("tenant_id", "")
         drone_id = header.get("drone_id", "")
         drone_serial = header.get("drone_serial", "")
-        type = header.get("type", "")
+        msg_type = header.get("type", "")
         payloads = data.get("payloads", [])
         protocol_version = header.get("protocol_version", "")
-        
-        # Step 2: Required fields
+
+        # Validation
         if not task_id:
-            self._publish_rejection("unknown", "missing header.task_id")
+            logger.warning("task_command rejected: missing header.task_id")
             return
         if not tenant_id:
-            self._publish_rejection(task_id, "missing header.tenant_id")
+            logger.warning(f"task_command '{task_id}' rejected: missing header.tenant_id")
             return
         if not drone_id:
-            self._publish_rejection(task_id, "missing header.drone_id")
+            logger.warning(f"task_command '{task_id}' rejected: missing header.drone_id")
             return
         if not drone_serial:
-            self._publish_rejection(task_id, "missing header.drone_serial")
+            logger.warning(f"task_command '{task_id}' rejected: missing header.drone_serial")
             return
-        if not type:
-            self._publish_rejection(task_id, "missing header.type")
+        if not msg_type:
+            logger.warning(f"task_command '{task_id}' rejected: missing header.type")
             return
         if not protocol_version:
-            self._publish_rejection(task_id, "missing header.protocol_version")
+            logger.warning(f"task_command '{task_id}' rejected: missing header.protocol_version")
             return
         if protocol_version != "1.0":
-            self._publish_rejection(task_id, f"unsupported protocol_version='{protocol_version}'")
+            logger.warning(f"task_command '{task_id}' rejected: unsupported protocol_version='{protocol_version}'")
             return
-        if not type.startswith("task_command"): 
-            self._publish_rejection(task_id, f"invalid header.type='{type}'")
+        if not msg_type.startswith("task_command"):
+            logger.warning(f"task_command '{task_id}' rejected: invalid header.type='{msg_type}'")
             return
         if not isinstance(payloads, list) or len(payloads) == 0:
-            self._publish_rejection(task_id, "payloads must be a non-empty list")
+            logger.warning(f"task_command '{task_id}' rejected: payloads must be a non-empty list")
             return
 
-        # Step 3: Identity check
+        # Identity check
         if drone_id != self._drone_id:
             logger.warning(
                 f"task_command rejected: drone_id='{drone_id}' "
                 f"!= configured='{self._drone_id}'"
             )
-            # Don't publish to MQTT — this message is for a different drone
             return
 
-        # Step 4: Duplicate check (MQTT QoS-1 re-delivery)
+        # Duplicate check (MQTT QoS-1 re-delivery)
         if task_id == self._last_task_id:
             logger.info(f"task_command: duplicate task_id='{task_id}' — dropped")
             return
         self._last_task_id = task_id
 
-        # Step 5: Build drone_msgs/TaskCommand
+        # Build drone_msgs/TaskCommand
         ros_msg = self._build_task_command_msg(data, header, payloads)
         if ros_msg is None:
-            self._publish_rejection(task_id, "failed to parse command items")
+            logger.warning(f"task_command '{task_id}' rejected: failed to parse command items")
             return
 
-        # Publish to ROS2 (mission_executor subscribes here)
         self._pub_task_command.publish(ros_msg)
-        logger.info(f"task_command '{task_id}' forwarded to /mqtt_bridge/in/task_command "
+        logger.info(f"task_command '{task_id}' forwarded to /mqtt_bridge/out/task_command "
                     f"({len(payloads)} commands)")
-
-        # Acknowledge to cloud: bridge received and forwarded the command
-        self._publish_task_status_update(
-            task_id=task_id,
-            task_status="RECEIVED",
-            current_sequence=0,
-            current_command_id="",
-            command_status="PENDING",
-            total=len(payloads),
-            done=0,
-        )
 
     def _build_task_command_msg(self, data: dict, header: dict,
                                 payloads: list) -> TaskCommand:
-        """Parse raw dict into drone_msgs/TaskCommand. Returns None on failure."""
         try:
             msg = TaskCommand()
             msg.task_id          = str(header.get("task_id", ""))
@@ -344,53 +317,17 @@ class MQTTBridgeNode(Node):
             },
         }
 
-    def _publish_rejection(self, task_id: str, reason: str) -> None:
-        logger.warning(f"task_command REJECTED: task_id='{task_id}' reason='{reason}'")
-        self._publish_task_status_update(
-            task_id=task_id, task_status="REJECTED",
-            current_sequence=0, current_command_id="",
-            command_status="FAILED", total=0, done=0,
-            abort_reason=reason,
-        )
-
-    def _publish_task_status_update(self, *, task_id, task_status, current_sequence,
-                                    current_command_id, command_status,
-                                    total, done, abort_reason="") -> None:
-        payloads = {
-            "task_id":            task_id,
-            "task_status":        task_status,
-            "current_sequence":   current_sequence,
-            "current_command_id": current_command_id,
-            "command_status":     command_status,
-            "waypoints_total":    total,
-            "waypoints_done":     done,
-            "abort_reason":       abort_reason if abort_reason else None,
-        }
-        envelope = {"header": {"task_id": task_id, **self._make_header("task_status")}, "payloads": payloads}
-        self._mqtt.publish(self._t_task_status, envelope, qos=1)
-
     def _timer_stats(self) -> None:
         self.get_logger().info(
             f"Forwarded — "
             f"telemetry:{self._pub_counts['telemetry']}  "
-            f"status:{self._pub_counts['status']}  "
-            f"alarm:{self._pub_counts['alarm']}  "
-            f"task_status:{self._pub_counts['task_status']}  "
+            f"ack:{self._pub_counts['ack']}  "
             f"| MQTT: {'connected' if self._mqtt.is_connected else 'DISCONNECTED'}"
         )
 
     def shutdown(self) -> None:
         self.get_logger().info("Shutting down MQTT bridge...")
-        offline = {
-            "header": self._make_header("status"),
-            "payload": {
-                "alive":           False,
-                "bridge_uptime_s": round(time.time() - self._start_time, 1),
-                "session_key":     self._session_key,
-                "reason":          "clean_shutdown",
-            },
-        }
-        self._mqtt.publish(self._t_status, offline, qos=1, retain=True)
+        self._publish_ack(alive=False)
         time.sleep(0.2)
         self._mqtt.disconnect()
         self.get_logger().info("MQTT bridge stopped.")
