@@ -37,6 +37,9 @@ def telemetry(msg) -> dict:
     battery = None
     if msg.battery.valid:
         _BATT_WARN = {0:"none",1:"low",2:"critical",3:"emergency",4:"failed"}
+        charge_cycles = None
+        if hasattr(msg.battery, "charge_cycles"):
+            charge_cycles = _f(msg.battery.charge_cycles)
         battery = {
             "connected":          msg.battery.connected,
             "voltage_v":          msg.battery.voltage_v,
@@ -44,15 +47,16 @@ def telemetry(msg) -> dict:
             "remaining_pct":      msg.battery.remaining_pct,
             "temperature_c":      _f(msg.battery.temperature_c),
             "time_remaining_min": _f(msg.battery.time_remaining_min),
+            "charge_cycles":      charge_cycles,
             "warning":            msg.battery.warning,
             "warning_label":      _BATT_WARN.get(msg.battery.warning, "unknown"),
         }
 
     return {
         "flight_mode": {
-            "armed":        msg.flight_mode.armed,
-            "in_air":       msg.flight_mode.in_air,
-            "landed":       msg.flight_mode.landed,
+            # "armed":        msg.flight_mode.armed,
+            # "in_air":       msg.flight_mode.in_air,
+            # "landed":       msg.flight_mode.landed,
             "flight_mode":  msg.flight_mode.flight_mode,
             "control_mode": msg.flight_mode.control_mode,
         },
@@ -89,21 +93,32 @@ def telemetry(msg) -> dict:
     }
 
 
-def status(msg, alive: bool, bridge_uptime_s: float, session_key: str) -> dict:
+def status(msg, alive: bool, bridge_uptime_s: float, session_key: str,
+           ros_connected: bool, in_task: bool, flight_mode=None) -> dict:
     """
-    drone_msgs/BridgeStatus → MQTT payload dict.
-    Bridge-side fields (alive, uptime, session_key) are added here
-    because they are not known by telemetry_node.
+    drone_msgs/BridgeStatus → MQTT payload dict (or None msg → null sub-fields).
+
+    Bridge-side fields (alive, uptime, session_key, ros_connected, in_task)
+    are added here because they are not known by telemetry_node. `flight_mode`
+    is the latest cached TelemetryData.flight_mode (for armed/landed/in_air).
     """
+    armed  = flight_mode.armed  if flight_mode is not None else None
+    landed = flight_mode.landed if flight_mode is not None else None
+    in_air = flight_mode.in_air if flight_mode is not None else None
     return {
-        "alive":              alive,
-        "ready":              msg.ready_for_flight,
-        "bridge_uptime_s":    bridge_uptime_s,
-        "session_key":        session_key,
-        "px4_connected":      msg.px4_connected,
-        "timesync_quality":   msg.timesync_quality if msg.timesync_valid else None,
-        "timesync_rtt_ms":    _f(msg.timesync_rtt_ms),
-        "flight_duration_s":  msg.flight_duration_s,
+        "alive":                     alive,
+        "ready_for_flight":          msg.ready_for_flight if msg is not None else None,
+        "in_task":                   in_task,
+        "armed":                     armed,
+        "landed":                    landed,
+        "in_air":                    in_air,
+        "bridge_uptime_s":           bridge_uptime_s,
+        "session_key":               session_key,
+        "ros_connected":             ros_connected,
+        "hardware_connected":        msg.px4_connected if msg is not None else None,
+        "hardware_timesync_quality": (msg.timesync_quality if msg.timesync_valid else None)
+                                     if msg is not None else None,
+        "flight_duration_s":         msg.flight_duration_s if msg is not None else None,
     }
 
 
@@ -125,19 +140,13 @@ def alarm(msg) -> dict:
     b = msg.battery
     battery_payload = None
     if b.valid:
-        # `charge_cycles` exists in drone_msgs/BatteryState; convert NaN to None like other floats.
-        charge_cycles = None
-        if hasattr(b, "charge_cycles"):
-            charge_cycles = _f(b.charge_cycles)
-
         battery_payload = {
-            "warning":           b.warning,
-            "warning_label":     b.warning_label,
-            "voltage_v":         b.voltage_v,
-            "voltage_per_cell_v": _f(b.voltage_per_cell_v),
-            "remaining_pct":     b.remaining_pct,
-            "connected":         b.connected,
-            "charge_cycles":     charge_cycles,
+            "warning":            b.warning,
+            "warning_label":      b.warning_label,
+            # "voltage_v":          b.voltage_v,
+            # "voltage_per_cell_v": _f(b.voltage_per_cell_v),
+            "remaining_pct":      b.remaining_pct,
+            "connected":          b.connected,
         }
 
     g = msg.gps
@@ -189,9 +198,25 @@ def alarm(msg) -> dict:
     }
 
 
-def task_status(msg) -> dict:
-    """drone_msgs/TaskStatus → MQTT payload dict."""
+def task_status(msg, in_task: bool) -> dict:
+    """
+    drone_msgs/TaskStatus → MQTT payload dict (or None msg → null sub-fields).
+    `in_task` is bridge-side state: True when a task is currently active.
+    """
+    if msg is None:
+        return {
+            "in_task":            in_task,
+            "task_id":            None,
+            "task_status":        None,
+            "current_sequence":   None,
+            "current_command_id": None,
+            "command_status":     None,
+            "waypoints_total":    None,
+            "waypoints_done":     None,
+            "abort_reason":       None,
+        }
     return {
+        "in_task":            in_task,
         "task_id":            msg.task_id,
         "task_status":        msg.task_status,
         "current_sequence":   msg.current_sequence,

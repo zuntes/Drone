@@ -35,7 +35,7 @@ def generate_launch_description():
         DeclareLaunchArgument('mqtt_host',          default_value='dev-lae-mqtt.viettelpost.vn'),
         DeclareLaunchArgument('mqtt_port',          default_value='443'),
         DeclareLaunchArgument('mqtt_username',      default_value='dungpt64'),
-        DeclareLaunchArgument('mqtt_password',      default_value='********'),
+        DeclareLaunchArgument('mqtt_password',      default_value='v12345678'),
         DeclareLaunchArgument('mqtt_tls',           default_value='true'),
         DeclareLaunchArgument('mqtt_transport',     default_value='websockets'),
         DeclareLaunchArgument('mqtt_ws_path',       default_value='/mqtt'),
