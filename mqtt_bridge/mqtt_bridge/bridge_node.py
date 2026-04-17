@@ -11,16 +11,19 @@ Outbound (ROS2 → MQTT) — two topics only:
 Inbound (MQTT → ROS2):
   drone/{t}/{id}/task_command → validate → /mqtt_bridge/out/task_command  drone_msgs/TaskCommand
 
-Header envelope added to every MQTT message:
+Envelope added to every outbound MQTT message:
   {
-    "header": { "tenant_id", "drone_id", "drone_serial", "type", "timestamp" },
-    "payload": { ... }
+    "event_id":  "<uuid4>",
+    "timestamp": { "date": "YYYY-MM-DD", "time": "HH:MM:SS.mmm" },
+    "metadata":  { "tenant_id", "drone_id", "drone_serial", "type" },
+    "payload":   { ... }
   }
 """
 
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -82,14 +85,13 @@ class MQTTBridgeNode(Node):
         self._pub_counts = {"telemetry": 0, "ack": 0}
 
         # ── MQTT client ───────────────────────────────────────────────────────
-        _lwt = {
-            "metadata":  self._make_header("ack"),
-            "payload": {
-                "alive":          False,
-                "session_key":    self._session_key,
-                "bridge_uptime_s": 0.0,
-            },
-        }
+        # LWT is static (set once at connect). event_id/timestamp are baked in
+        # at construction time — acceptable since LWT only fires on abnormal disconnect.
+        _lwt = self._make_envelope("ack", {
+            "alive":           False,
+            "session_key":     self._session_key,
+            "bridge_uptime_s": 0.0,
+        })
         self._mqtt = MQTTClient(
             host=p['mqtt_host'],
             port=p['mqtt_port'],
@@ -156,7 +158,7 @@ class MQTTBridgeNode(Node):
             "task_status": serializers.task_status(self._last_task_status)
                            if self._last_task_status else None,
         }
-        envelope = {"metadata": self._make_header("telemetry"), "payload": payload}
+        envelope = self._make_envelope("telemetry", payload)
         if self._mqtt.publish(self._t_telemetry, envelope, qos=0):
             self._pub_counts["telemetry"] += 1
 
@@ -172,14 +174,11 @@ class MQTTBridgeNode(Node):
     # ── Outbound: ack heartbeat ──────────────────────────────────────────────
 
     def _publish_ack(self, alive: bool) -> None:
-        envelope = {
-            "metadata": self._make_header("ack"),
-            "payload": {
-                "alive":          alive,
-                "session_key":    self._session_key,
-                "bridge_uptime_s": round(time.time() - self._start_time, 1),
-            },
-        }
+        envelope = self._make_envelope("ack", {
+            "alive":           alive,
+            "session_key":     self._session_key,
+            "bridge_uptime_s": round(time.time() - self._start_time, 1),
+        })
         if self._mqtt.publish(self._t_ack, envelope, qos=1, retain=True):
             self._pub_counts["ack"] += 1
 
@@ -195,39 +194,41 @@ class MQTTBridgeNode(Node):
             logger.error(f"task_command: invalid JSON: {e}")
             return
 
-        header   = data.get("metadata", {})
-        task_id  = header.get("task_id", "")
-        tenant_id = header.get("tenant_id", "")
-        drone_id = header.get("drone_id", "")
-        drone_serial = header.get("drone_serial", "")
-        msg_type = header.get("type", "")
-        payloads = data.get("payloads", [])
-        protocol_version = header.get("protocol_version", "")
+        event_id         = data.get("event_id", "")
+        timestamp        = data.get("timestamp", "")
+        metadata         = data.get("metadata", {})
+        task_id          = metadata.get("task_id", "")
+        tenant_id        = metadata.get("tenant_id", "")
+        drone_id         = metadata.get("drone_id", "")
+        drone_serial     = metadata.get("drone_serial", "")
+        msg_type         = metadata.get("type", "")
+        protocol_version = metadata.get("protocol_version", "")
+        payloads         = data.get("payloads", [])
 
         # Validation
         if not task_id:
-            logger.warning("task_command rejected: missing header.task_id")
+            logger.warning("task_command rejected: missing metadata.task_id")
             return
         if not tenant_id:
-            logger.warning(f"task_command '{task_id}' rejected: missing header.tenant_id")
+            logger.warning(f"task_command '{task_id}' rejected: missing metadata.tenant_id")
             return
         if not drone_id:
-            logger.warning(f"task_command '{task_id}' rejected: missing header.drone_id")
+            logger.warning(f"task_command '{task_id}' rejected: missing metadata.drone_id")
             return
         if not drone_serial:
-            logger.warning(f"task_command '{task_id}' rejected: missing header.drone_serial")
+            logger.warning(f"task_command '{task_id}' rejected: missing metadata.drone_serial")
             return
         if not msg_type:
-            logger.warning(f"task_command '{task_id}' rejected: missing header.type")
+            logger.warning(f"task_command '{task_id}' rejected: missing metadata.type")
             return
         if not protocol_version:
-            logger.warning(f"task_command '{task_id}' rejected: missing header.protocol_version")
+            logger.warning(f"task_command '{task_id}' rejected: missing metadata.protocol_version")
             return
         if protocol_version != "1.0":
             logger.warning(f"task_command '{task_id}' rejected: unsupported protocol_version='{protocol_version}'")
             return
         if not msg_type.startswith("task_command"):
-            logger.warning(f"task_command '{task_id}' rejected: invalid header.type='{msg_type}'")
+            logger.warning(f"task_command '{task_id}' rejected: invalid metadata.type='{msg_type}'")
             return
         if not isinstance(payloads, list) or len(payloads) == 0:
             logger.warning(f"task_command '{task_id}' rejected: payloads must be a non-empty list")
@@ -248,24 +249,24 @@ class MQTTBridgeNode(Node):
         self._last_task_id = task_id
 
         # Build drone_msgs/TaskCommand
-        ros_msg = self._build_task_command_msg(data, header, payloads)
+        ros_msg = self._build_task_command_msg(metadata, timestamp, payloads)
         if ros_msg is None:
             logger.warning(f"task_command '{task_id}' rejected: failed to parse command items")
             return
 
         self._pub_task_command.publish(ros_msg)
-        logger.info(f"task_command '{task_id}' forwarded to /mqtt_bridge/out/task_command "
-                    f"({len(payloads)} commands)")
+        logger.info(f"task_command '{task_id}' (event_id={event_id}) forwarded to "
+                    f"/mqtt_bridge/out/task_command ({len(payloads)} commands)")
 
-    def _build_task_command_msg(self, data: dict, header: dict,
+    def _build_task_command_msg(self, metadata: dict, timestamp,
                                 payloads: list) -> TaskCommand:
         try:
             msg = TaskCommand()
-            msg.task_id          = str(header.get("task_id", ""))
-            msg.tenant_id        = str(header.get("tenant_id", ""))
-            msg.drone_id         = str(header.get("drone_id", ""))
-            msg.timestamp        = str(header.get("timestamp", ""))
-            msg.protocol_version = str(header.get("protocol_version", "1.0"))
+            msg.task_id          = str(metadata.get("task_id", ""))
+            msg.tenant_id        = str(metadata.get("tenant_id", ""))
+            msg.drone_id         = str(metadata.get("drone_id", ""))
+            msg.timestamp        = str(timestamp) if timestamp else ""
+            msg.protocol_version = str(metadata.get("protocol_version", "1.0"))
 
             for item in payloads:
                 ci = CommandItem()
@@ -304,17 +305,24 @@ class MQTTBridgeNode(Node):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _make_header(self, msg_type: str) -> dict:
-        now = datetime.now(timezone.utc)
+    def _make_metadata(self, msg_type: str) -> dict:
         return {
             "tenant_id":    self._tenant_id,
             "drone_id":     self._drone_id,
             "drone_serial": self._drone_serial,
             "type":         msg_type,
+        }
+
+    def _make_envelope(self, msg_type: str, payload: dict) -> dict:
+        now = datetime.now(timezone.utc)
+        return {
+            "event_id":  str(uuid.uuid4()),
             "timestamp": {
                 "date": now.strftime("%Y-%m-%d"),
                 "time": now.strftime("%H:%M:%S.") + f"{now.microsecond//1000:03d}",
             },
+            "metadata": self._make_metadata(msg_type),
+            "payload":  payload,
         }
 
     def _timer_stats(self) -> None:
