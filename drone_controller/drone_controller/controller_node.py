@@ -4,34 +4,40 @@ drone_controller/controller_node.py
 VTP Robotics — Drone Controller
 PX4 v1.16.1 / px4_msgs v1.16.1
 
-Bugs fixed vs previous version
-───────────────────────────────
-1. INIT re-entry loop
-   Old code: phase stayed INIT while waiting for position → _step() reset
-   _phase_cycle=0 every single cycle → header printed every cycle.
-   Fix: INIT transitions immediately to WAITING_DATA, which is the
-   actual waiting state. INIT prints the header exactly once.
+Design: delegate trajectory/stabilization to PX4 autopilot. The node
+issues high-level navigation commands and lets PX4's native state
+machine execute them. No manual offboard streaming for TAKEOFF/GO_TO/
+RTL/LAND — that is what the autopilot is for.
 
-2. QoS mismatch (silent subscription failure)
-   PX4 DDS topics are BEST_EFFORT + VOLATILE.
-   Old code used TRANSIENT_LOCAL → silently receives zero messages.
-   Fix: all px4 subscribers use BEST_EFFORT + VOLATILE.
+Commands used
+─────────────
+  TAKE_OFF        → ARM + VEHICLE_CMD_NAV_TAKEOFF   (PX4 AUTO.TAKEOFF)
+  GO_TO           → OFFBOARD + TrajectorySetpoint   (NED position)
+  PAUSE           → DO_SET_MODE → AUTO.LOITER (main=4 sub=3)
+  CONTINUE        → resume from paused cmd index
+  RETURN_TO_HOME  → VEHICLE_CMD_NAV_RETURN_TO_LAUNCH (AUTO.RTL)
+  LAND            → VEHICLE_CMD_NAV_LAND             (AUTO.LAND)
 
-3. GCS connection drop ("No connection to ground control station")
-   The warn message in PX4 means the MAVLink GCS heartbeat stopped.
-   gcs_heartbeat_node must be running and its UDP port must reach PX4.
-   The node now prints clear diagnostics if GCS is not alive.
+TAKE_OFF uses VEHICLE_CMD_NAV_TAKEOFF (MAVLink 22): PX4 handles the
+takeoff ramp, yaw, and climb speed with its tuned controllers.
 
-PX4 v1.16.1 topic names used
-──────────────────────────────
-  /fmu/out/vehicle_status_v2           ← versioned
-  /fmu/out/vehicle_local_position_v1   ← versioned
+GO_TO uses OFFBOARD mode (not DO_REPOSITION): PX4 v1.16.1's commander
+returns "command 192 unsupported" for DO_REPOSITION on multicopter
+builds, so external waypoint control is done through the officially
+supported OFFBOARD path. Target lat/lon is projected into local NED
+using VehicleLocalPosition.ref_lat/ref_lon, then streamed as
+TrajectorySetpoint at the control loop rate.
+
+Incoming command payload (via mqtt_bridge):
+  latitude/longitude (opt), altitude (m, treated as AGL/home-rel),
+  speed (m/s, opt). Accepts either "TAKEOFF" or "TAKE_OFF".
+
+PX4 topic names (v1.16.1)
+─────────────────────────
+  /fmu/out/vehicle_status_v1
+  /fmu/out/vehicle_local_position
   /fmu/out/vehicle_land_detected
   /fmu/out/vehicle_global_position
-
-GO_TO uses VEHICLE_CMD_DO_REPOSITION (MAVLink 192)
-  param1=speed, param5=lat, param6=lon, param7=alt_amsl
-  PX4 navigates internally — no NED conversion required.
 """
 
 import math
@@ -41,22 +47,32 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from px4_msgs.msg import (
     OffboardControlMode, TrajectorySetpoint, VehicleCommand,
-    VehicleLocalPosition, VehicleStatus, VehicleLandDetected,
-    VehicleGlobalPosition,
+    VehicleCommandAck, VehicleLocalPosition, VehicleStatus,
+    VehicleLandDetected, VehicleGlobalPosition,
 )
 from drone_msgs.msg import TaskCommand, TaskStatus
 from std_msgs.msg import Bool
 
 # ── Tunable ───────────────────────────────────────────────────────────────────
 CONTROL_HZ          = 20.0
-OFFBOARD_WARMUP     = 25        # cycles before OFFBOARD switch  (~1.25 s)
 ALT_TOLERANCE_M     = 1.5       # m: takeoff done when alt >= target - tol
-ARM_RETRY_CYCLES    = 40        # cycles between ARM retries
+ARM_RETRY_CYCLES    = 40        # cycles between ARM retries (~2 s at 20 Hz)
 ARM_TIMEOUT_S       = 20.0
 DEFAULT_SPEED_MS    = 5.0
-DEFAULT_ARRIVAL_R_M = 1.0
+DEFAULT_ARRIVAL_R_M = 2.0
 LAND_ALT_FALLBACK_M = 0.5       # sim: also declare landed if alt < this
+# GO_TO sequencing (OFFBOARD path — PX4 v1.16.1 rejects DO_REPOSITION for
+# multicopter, so we stream TrajectorySetpoint + OffboardControlMode, then
+# switch into OFFBOARD mode once PX4 has seen enough setpoints).
+OFFBOARD_PRESTREAM_CYCLES = 20   # stream setpoints ~1 s before mode switch
 EARTH_R             = 6_371_000.0
+
+# Status strings the rest of the system expects
+CMD_PENDING    = 'PENDING'
+CMD_RUNNING    = 'RUNNING'
+CMD_COMPLETED  = 'COMPLETED'
+CMD_FAILED     = 'FAILED'
+CMD_CANCELED   = 'CANCELED'
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -70,10 +86,19 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
     return 2 * EARTH_R * math.asin(min(1.0, math.sqrt(a)))
 
 
+def _latlon_to_ne(ref_lat, ref_lon, lat, lon):
+    """Equirectangular projection relative to (ref_lat, ref_lon).
+    Accurate to ~cm for ranges of a few km (typical mission scale).
+    Returns (north_m, east_m) in PX4 NED frame."""
+    ref_lat_r = math.radians(ref_lat)
+    n = math.radians(lat - ref_lat) * EARTH_R
+    e = math.radians(lon - ref_lon) * EARTH_R * math.cos(ref_lat_r)
+    return n, e
+
+
 class Phase:
     INIT         = 'INIT'          # print header once, then → WAITING_DATA
     WAITING_DATA = 'WAITING_DATA'  # gate on prerequisites (pos, gcs, etc.)
-    WARMUP       = 'WARMUP'        # stream offboard before mode switch
     ARMING       = 'ARMING'
     CLIMBING     = 'CLIMBING'
     FLYING       = 'FLYING'
@@ -108,14 +133,18 @@ class DroneControllerNode(Node):
         )
 
         # ── Publishers ────────────────────────────────────────────────────
+        # VehicleCommand: high-level commands (arm, NAV_TAKEOFF, NAV_LAND, RTL, SET_MODE)
+        # OffboardControlMode + TrajectorySetpoint: used for GO_TO (OFFBOARD mode).
+        # PX4 v1.16.1 does not dispatch DO_REPOSITION for multicopter, so
+        # GO_TO runs through the officially supported offboard path.
+        self._pub_command    = self.create_publisher(
+            VehicleCommand,      '/fmu/in/vehicle_command',       px4_pub_qos)
         self._pub_offboard   = self.create_publisher(
             OffboardControlMode, '/fmu/in/offboard_control_mode', px4_pub_qos)
         self._pub_trajectory = self.create_publisher(
             TrajectorySetpoint,  '/fmu/in/trajectory_setpoint',   px4_pub_qos)
-        self._pub_command    = self.create_publisher(
-            VehicleCommand,      '/fmu/in/vehicle_command',        px4_pub_qos)
         self._pub_status     = self.create_publisher(
-            TaskStatus,          '/mqtt_bridge/in/task_status',    ros_qos)
+            TaskStatus,          '/mqtt_bridge/in/task_status',   ros_qos)
 
         # ── PX4 subscribers  (BEST_EFFORT + VOLATILE) ─────────────────────
         self.create_subscription(
@@ -134,6 +163,10 @@ class DroneControllerNode(Node):
             VehicleGlobalPosition,
             '/fmu/out/vehicle_global_position',
             lambda m: setattr(self, '_gpos', m), px4_sub_qos)
+        self.create_subscription(
+            VehicleCommandAck,
+            '/fmu/out/vehicle_command_ack',
+            self._on_command_ack, px4_sub_qos)
 
         # ── Internal ──────────────────────────────────────────────────────
         self.create_subscription(
@@ -158,14 +191,18 @@ class DroneControllerNode(Node):
         self._phase_cycle = 0
         self._task_state  = 'IDLE'
 
-        # ── Offboard (TAKEOFF only) ───────────────────────────────────────
-        self._ob_active = False
-        self._ob_target = [0.0, 0.0, 0.0]
-
-        # ── GO_TO target ──────────────────────────────────────────────────
-        self._goto_lat     = 0.0
-        self._goto_lon     = 0.0
-        self._goto_arrival = DEFAULT_ARRIVAL_R_M
+        # ── TAKE_OFF / GO_TO targets ──────────────────────────────────────
+        self._takeoff_target_alt_m = 0.0
+        self._goto_lat      = 0.0
+        self._goto_lon      = 0.0
+        self._goto_alt_m    = 0.0                  # home-relative
+        self._goto_speed    = DEFAULT_SPEED_MS
+        self._goto_arrival  = DEFAULT_ARRIVAL_R_M
+        # Offboard streaming (NED setpoint towards GO_TO target).
+        self._ob_active  = False
+        self._ob_target_ned = [0.0, 0.0, 0.0]      # [N, E, D]
+        self._ob_yaw     = float('nan')            # NaN = current
+        self._flying_entry_cycle = 0               # cycle when FLYING started
 
         # ── Misc ──────────────────────────────────────────────────────────
         self._arm_start_time = None
@@ -185,6 +222,19 @@ class DroneControllerNode(Node):
 
     def _on_land_detected(self, msg):
         self._landed = msg.landed
+
+    def _on_command_ack(self, msg):
+        """Log PX4 rejections for commands we send so we can see what
+        happened (armed, takeoff, set_mode, etc.). Accepted commands
+        are quiet to avoid log spam."""
+        if msg.result in (
+            VehicleCommandAck.VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED,
+            VehicleCommandAck.VEHICLE_CMD_RESULT_UNSUPPORTED,
+            VehicleCommandAck.VEHICLE_CMD_RESULT_DENIED,
+            VehicleCommandAck.VEHICLE_CMD_RESULT_FAILED,
+        ):
+            self.get_logger().warn(
+                f'  PX4 rejected cmd={msg.command} result={msg.result}')
 
     def _is_landed(self) -> bool:
         """3-signal landed check (robust in simulation)."""
@@ -236,33 +286,25 @@ class DroneControllerNode(Node):
         self._phase       = Phase.INIT
         self._phase_cycle = 0
         self._task_state  = 'EXECUTING'
-        self._ob_active   = False
         self._cycle       = 0
         self.get_logger().info(
             f'Task {msg.task_id} accepted  ({len(cmds)} commands)')
-        self._publish_status(msg.task_id, 'RECEIVED', 0, '', 'PENDING',
+        self._publish_status(msg.task_id, 'RECEIVED', 0, '', CMD_PENDING,
                              len(cmds), 0)
 
     def _validate(self, cmds):
         for cmd in cmds:
             ct, pl, cid = cmd.command_type, cmd.payload, cmd.command_id
-            if ct == 'TAKEOFF':
+            if ct in ('TAKEOFF', 'TAKE_OFF'):
                 if not pl.has_altitude:
-                    return False, (
-                        f'{cid}: TAKEOFF requires altitude '
-                        f'(has_altitude=true, altitude_m)')
+                    return False, f'{cid}: TAKE_OFF requires altitude'
             elif ct == 'GO_TO':
                 if not pl.has_position:
-                    return False, (
-                        f'{cid}: GO_TO requires position '
-                        f'(has_position=true, lat/lon)')
+                    return False, f'{cid}: GO_TO requires latitude/longitude'
                 if not pl.has_altitude:
-                    return False, (
-                        f'{cid}: GO_TO requires altitude '
-                        f'(has_altitude=true, altitude_m)')
+                    return False, f'{cid}: GO_TO requires altitude'
                 if pl.latitude == 0.0 and pl.longitude == 0.0:
-                    return False, (
-                        f'{cid}: GO_TO lat=0 lon=0 — missing position payload')
+                    return False, f'{cid}: GO_TO lat=0 lon=0 — invalid position'
             elif ct not in ('PAUSE', 'CONTINUE', 'RETURN_TO_HOME',
                             'LAND', 'ABORT'):
                 return False, f'{cid}: unknown command_type="{ct}"'
@@ -273,6 +315,8 @@ class DroneControllerNode(Node):
     def _loop(self):
         self._cycle += 1
 
+        # Offboard must stream before AND while in OFFBOARD mode (PX4 drops
+        # out of OFFBOARD if setpoints stop for ~0.5 s).
         if self._ob_active:
             self._stream_offboard()
 
@@ -301,12 +345,13 @@ class DroneControllerNode(Node):
                 f'seq={cmd.sequence}/{len(self._cmds)}')
             self._publish_status(
                 self._task.task_id, 'EXECUTING',
-                cmd.sequence, cmd.command_id, 'IN_PROGRESS',
+                cmd.sequence, cmd.command_id, CMD_RUNNING,
                 len(self._cmds), self._cidx)
             self._phase = Phase.WAITING_DATA   # ← prevents INIT re-entry
 
         dispatch = {
             'TAKEOFF':        self._exec_takeoff,
+            'TAKE_OFF':       self._exec_takeoff,
             'GO_TO':          self._exec_go_to,
             'PAUSE':          self._exec_pause,
             'CONTINUE':       self._exec_continue,
@@ -321,7 +366,7 @@ class DroneControllerNode(Node):
             self.get_logger().info(f'[{cmd.command_id}] ✔  COMPLETED')
             self._publish_status(
                 self._task.task_id, 'EXECUTING',
-                cmd.sequence, cmd.command_id, 'COMPLETED',
+                cmd.sequence, cmd.command_id, CMD_COMPLETED,
                 len(self._cmds), self._cidx + 1)
             self._cidx       += 1
             self._phase       = Phase.INIT
@@ -330,6 +375,13 @@ class DroneControllerNode(Node):
     # ── TAKEOFF ───────────────────────────────────────────────────────────────
 
     def _exec_takeoff(self, cmd) -> bool:
+        """
+        PX4-native TAKE_OFF:
+          1. Wait for local+global position.
+          2. Send NAV_TAKEOFF with AMSL altitude (PX4 enters AUTO.TAKEOFF).
+          3. Send ARM. PX4 executes takeoff ramp/climb with its own controllers.
+          4. Poll altitude until within ALT_TOLERANCE_M of target.
+        """
         target_alt = float(cmd.payload.altitude_m)
 
         if self._phase == Phase.WAITING_DATA:
@@ -337,47 +389,51 @@ class DroneControllerNode(Node):
             if self._lpos is None:
                 if self._phase_cycle % int(CONTROL_HZ * 2) == 0:
                     self.get_logger().warn(
-                        '  TAKEOFF: waiting for local position '
+                        '  TAKE_OFF: waiting for local position '
                         '(is DDS agent running? ROS_LOCALHOST_ONLY=1 set?)')
+                ready = False
+            if self._gpos is None:
+                if self._phase_cycle % int(CONTROL_HZ * 2) == 0:
+                    self.get_logger().warn('  TAKE_OFF: waiting for global position (GPS fix)')
                 ready = False
             if not self._gcs_alive:
                 if self._phase_cycle % int(CONTROL_HZ * 2) == 0:
                     self.get_logger().warn(
-                        '  TAKEOFF: waiting for GCS heartbeat '
+                        '  TAKE_OFF: waiting for GCS heartbeat '
                         '(gcs_heartbeat_node must be running and connected)')
                 ready = False
             if not ready:
                 return False
-            # Start offboard stream at current position
-            self._ob_target = [
-                float(self._lpos.x),
-                float(self._lpos.y),
-                float(self._lpos.z),
-            ]
-            self._ob_active = True
-            self._phase     = Phase.WARMUP
-            self.get_logger().info(
-                f'  TAKEOFF: offboard stream started  target={target_alt} m')
-            return False
 
-        if self._phase == Phase.WARMUP:
-            if self._phase_cycle >= OFFBOARD_WARMUP:
-                self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
-                               p1=1.0, p2=6.0)
-                self._send_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
-                               p1=1.0)
-                self._arm_start_time = self.get_clock().now()
-                self._arm_retry_at   = self._cycle + ARM_RETRY_CYCLES
-                self._phase          = Phase.ARMING
-                self.get_logger().info('  TAKEOFF: OFFBOARD + ARM sent')
+            self._takeoff_target_alt_m = target_alt
+            alt_amsl = self._get_home_amsl() + target_alt
+
+            # NAV_TAKEOFF must be sent BEFORE arming so PX4 switches to
+            # AUTO.TAKEOFF mode; otherwise ARM is rejected by the preflight
+            # check in non-manual modes.
+            self._send_cmd(
+                VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
+                p1=-1.0,                      # pitch: use default
+                p4=float('nan'),              # yaw: current
+                p5=float(self._gpos.lat),
+                p6=float(self._gpos.lon),
+                p7=alt_amsl,
+            )
+            self._send_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+                           p1=1.0, p2=0.0)
+            self._arm_start_time = self.get_clock().now()
+            self._arm_retry_at   = self._cycle + ARM_RETRY_CYCLES
+            self._phase          = Phase.ARMING
+            self.get_logger().info(
+                f'  TAKE_OFF: NAV_TAKEOFF + ARM sent  '
+                f'target_alt_home={target_alt} m  amsl={alt_amsl:.1f} m')
             return False
 
         if self._phase == Phase.ARMING:
             if self._is_armed():
-                self._ob_target[2] = -target_alt
-                self._phase        = Phase.CLIMBING
+                self._phase = Phase.CLIMBING
                 self.get_logger().info(
-                    f'  TAKEOFF: armed! climbing to {target_alt} m...')
+                    f'  TAKE_OFF: armed — PX4 climbing to {target_alt} m')
                 return False
             elapsed = (
                 self.get_clock().now() - self._arm_start_time
@@ -386,7 +442,7 @@ class DroneControllerNode(Node):
                 nav = self._vstatus.nav_state    if self._vstatus else '?'
                 arm = self._vstatus.arming_state if self._vstatus else '?'
                 self._abort_task(
-                    f'TAKEOFF arm timeout {ARM_TIMEOUT_S:.0f}s. '
+                    f'TAKE_OFF arm timeout {ARM_TIMEOUT_S:.0f}s. '
                     f'nav_state={nav} arming_state={arm}. '
                     f'Check: GPS 3D fix, COM_RCL_EXCEPT, GCS heartbeat.')
                 return False
@@ -396,74 +452,148 @@ class DroneControllerNode(Node):
                 arm = self._vstatus.arming_state if self._vstatus else '?'
                 self.get_logger().warn(
                     f'  ARM retry  nav_state={nav}  arming_state={arm}')
-                self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
-                               p1=1.0, p2=6.0)
+                alt_amsl = self._get_home_amsl() + target_alt
+                self._send_cmd(
+                    VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF,
+                    p1=-1.0, p4=float('nan'),
+                    p5=float(self._gpos.lat) if self._gpos else 0.0,
+                    p6=float(self._gpos.lon) if self._gpos else 0.0,
+                    p7=alt_amsl,
+                )
                 self._send_cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
-                               p1=1.0)
+                               p1=1.0, p2=0.0)
             return False
 
         if self._phase == Phase.CLIMBING:
             alt = self._alt_rel_home()
+            nav = self._vstatus.nav_state if self._vstatus else -1
             if self._phase_cycle % int(CONTROL_HZ) == 0 and alt is not None:
                 self.get_logger().info(
-                    f'  Climbing: {alt:.1f} m / {target_alt} m')
-            if alt is not None and alt >= target_alt - ALT_TOLERANCE_M:
+                    f'  Climbing: {alt:.1f} m / {target_alt} m  nav_state={nav}')
+            # Complete when altitude reached AND PX4 has exited AUTO.TAKEOFF.
+            # PX4 transitions TAKEOFF → LOITER once the navigator considers
+            # the climb done; waiting for this ensures the next command
+            # starts from a stable hover.
+            alt_ok = alt is not None and alt >= target_alt - ALT_TOLERANCE_M
+            mode_ok = nav != VehicleStatus.NAVIGATION_STATE_AUTO_TAKEOFF
+            if alt_ok and mode_ok:
                 return True
         return False
 
     # ── GO_TO ─────────────────────────────────────────────────────────────────
 
     def _exec_go_to(self, cmd) -> bool:
+        """
+        GO_TO via OFFBOARD + TrajectorySetpoint (PX4 v1.16.1 multicopter).
+
+        PX4 v1.16.1's commander does not dispatch DO_REPOSITION (192) for
+        multicopter in this build — every send is rejected as "unsupported"
+        and the drone only moves as a side effect of the preceding mode
+        switch. The officially supported external-control path for PX4 is
+        OFFBOARD mode fed with TrajectorySetpoint.
+
+        Sequencing:
+          1. Wait for global position, local position with valid NED
+             reference (ref_lat/ref_lon), and PX4 to be out of AUTO.TAKEOFF.
+          2. Convert target (lat/lon/alt_home) → NED using the local
+             position reference and home AMSL.
+          3. Start streaming OffboardControlMode + TrajectorySetpoint at
+             the control-loop rate. PX4 requires ≥2 Hz setpoints for ~1 s
+             before it will accept OFFBOARD; we pre-stream then switch.
+          4. Send DO_SET_MODE → OFFBOARD (main=1, sub=6). PX4 executes
+             smooth trajectory generation internally using its tuned
+             position controller. max_horizontal_speed is respected via
+             yaw-aligned velocity limiting in PX4's MPC_* params (speed
+             passed via TrajectorySetpoint.velocity magnitude hint by
+             leaving velocity NaN and relying on MPC_XY_CRUISE).
+          5. Hold setpoint at arrival; caller can chain next GO_TO, LAND,
+             RTH, etc. Offboard stream is turned off when GO_TO exits.
+        """
         pl        = cmd.payload
-        speed     = float(pl.speed_ms)         if pl.has_speed          else DEFAULT_SPEED_MS
-        arrival_r = float(pl.arrival_radius_m) if pl.has_arrival_radius else DEFAULT_ARRIVAL_R_M
+        speed     = float(pl.speed_ms) if pl.has_speed else DEFAULT_SPEED_MS
+        arrival_r = DEFAULT_ARRIVAL_R_M
         tgt_lat   = float(pl.latitude)
         tgt_lon   = float(pl.longitude)
         tgt_alt_m = float(pl.altitude_m)
-        ref       = (pl.altitude_ref.strip().lower()
-                     if pl.altitude_ref else 'home')
 
         if self._phase == Phase.WAITING_DATA:
-            if self._gpos is None:
+            if self._gpos is None or self._lpos is None:
                 if self._phase_cycle % int(CONTROL_HZ * 2) == 0:
                     self.get_logger().warn(
-                        '  GO_TO: waiting for global position...')
+                        '  GO_TO: waiting for global+local position...')
+                return False
+            if not (self._lpos.xy_global and self._lpos.z_global):
+                if self._phase_cycle % int(CONTROL_HZ * 2) == 0:
+                    self.get_logger().warn(
+                        '  GO_TO: local position has no global reference yet')
+                return False
+            nav = self._vstatus.nav_state if self._vstatus else -1
+            if nav == VehicleStatus.NAVIGATION_STATE_AUTO_TAKEOFF:
+                if self._phase_cycle % int(CONTROL_HZ) == 0:
+                    self.get_logger().info(
+                        '  GO_TO: waiting for PX4 to finish AUTO.TAKEOFF...')
                 return False
 
-            home_amsl = self._get_home_amsl()
-            alt_amsl  = tgt_alt_m if ref == 'amsl' else tgt_alt_m + home_amsl
+            # lat/lon → local NED using PX4's NED reference.
+            n, e = _latlon_to_ne(
+                float(self._lpos.ref_lat), float(self._lpos.ref_lon),
+                tgt_lat, tgt_lon)
+            # Down = -(alt_home + home_amsl - ref_alt). ref_alt is AMSL.
+            target_amsl = self._get_home_amsl() + tgt_alt_m
+            d = -(target_amsl - float(self._lpos.ref_alt))
 
-            self._goto_lat     = tgt_lat
-            self._goto_lon     = tgt_lon
-            self._goto_arrival = arrival_r
-            self._ob_active    = False   # DO_REPOSITION works without offboard
+            self._goto_lat      = tgt_lat
+            self._goto_lon      = tgt_lon
+            self._goto_alt_m    = tgt_alt_m
+            self._goto_speed    = speed
+            self._goto_arrival  = arrival_r
+            self._ob_target_ned = [n, e, d]
+            # Yaw towards target (heading from current NED position).
+            dn = n - float(self._lpos.x)
+            de = e - float(self._lpos.y)
+            self._ob_yaw = math.atan2(de, dn) if (dn*dn + de*de) > 1.0 else float('nan')
 
-            self._send_cmd(
-                VehicleCommand.VEHICLE_CMD_DO_REPOSITION,
-                p1=speed,
-                p5=tgt_lat,
-                p6=tgt_lon,
-                p7=alt_amsl,
-            )
+            # Begin streaming immediately; PX4 needs a few setpoints before
+            # OFFBOARD is accepted. The mode switch happens after the
+            # pre-stream period elapses.
+            self._ob_active = True
             self._phase = Phase.FLYING
+            self._flying_entry_cycle = self._cycle
             self.get_logger().info(
-                f'  GO_TO: lat={tgt_lat:.6f} lon={tgt_lon:.6f} '
-                f'alt_amsl={alt_amsl:.1f} m  speed={speed} m/s  '
-                f'arrival_r={arrival_r} m')
+                f'  GO_TO: target lat={tgt_lat:.6f} lon={tgt_lon:.6f} '
+                f'alt_home={tgt_alt_m:.1f} m  ned=({n:.1f},{e:.1f},{d:.1f})  '
+                f'speed={speed} m/s → OFFBOARD')
             return False
 
         if self._phase == Phase.FLYING:
-            if self._gpos is None:
+            if self._gpos is None or self._lpos is None:
                 return False
+
+            # After pre-streaming setpoints, switch to OFFBOARD once.
+            cycles_since_entry = self._cycle - self._flying_entry_cycle
+            nav = self._vstatus.nav_state if self._vstatus else -1
+            if (cycles_since_entry == OFFBOARD_PRESTREAM_CYCLES
+                    and nav != VehicleStatus.NAVIGATION_STATE_OFFBOARD):
+                self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
+                               p1=1.0, p2=6.0)
+                self.get_logger().info('  GO_TO: sent SET_MODE → OFFBOARD')
+
             dist = haversine_m(
                 float(self._gpos.lat), float(self._gpos.lon),
                 self._goto_lat, self._goto_lon)
+            alt  = self._alt_rel_home()
+            alt_err = abs((alt or 0.0) - tgt_alt_m)
             if self._phase_cycle % int(CONTROL_HZ) == 0:
                 self.get_logger().info(
                     f'  GO_TO: {dist:.1f} m to target  '
-                    f'(arrival_r={arrival_r:.1f} m)')
-            if dist <= arrival_r:
-                self.get_logger().info(f'  GO_TO: arrived!  dist={dist:.2f} m')
+                    f'(arrival_r={arrival_r:.1f} m)  alt_err={alt_err:.1f} m  '
+                    f'nav_state={nav}')
+            # Arrived when both horizontal distance AND altitude are within bounds
+            if dist <= arrival_r and alt_err <= ALT_TOLERANCE_M:
+                self.get_logger().info(
+                    f'  GO_TO: arrived!  dist={dist:.2f} m  alt_err={alt_err:.2f} m')
+                # Stop offboard stream; PX4 falls back to position HOLD.
+                self._ob_active = False
                 return True
         return False
 
@@ -472,15 +602,16 @@ class DroneControllerNode(Node):
     def _exec_pause(self, cmd) -> bool:
         if self._phase == Phase.WAITING_DATA:
             self.get_logger().info(
-                '  PAUSE: switching to HOLD, awaiting CONTINUE')
-            self._ob_active  = False
+                '  PAUSE: switching to AUTO.LOITER (HOLD), awaiting CONTINUE')
+            self._ob_active = False
+            # main_mode=4 (AUTO), sub_mode=3 (LOITER) — PX4 holds position
             self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
-                           p1=1.0, p2=4.0)
+                           p1=1.0, p2=4.0, p3=3.0)
             self._task_state = 'PAUSED'
             self._phase      = Phase.HOLDING
             self._publish_status(
                 self._task.task_id, 'PAUSED',
-                cmd.sequence, cmd.command_id, 'IN_PROGRESS',
+                cmd.sequence, cmd.command_id, CMD_RUNNING,
                 len(self._cmds), self._cidx)
         return False
 
@@ -544,7 +675,7 @@ class DroneControllerNode(Node):
         self._ob_active  = False
         self.get_logger().info(f'✅  Task {self._task.task_id} COMPLETED')
         self._publish_status(
-            self._task.task_id, 'COMPLETED', 0, '', 'COMPLETED',
+            self._task.task_id, 'COMPLETED', 0, '', CMD_COMPLETED,
             len(self._cmds), len(self._cmds))
 
     def _abort_task(self, reason: str):
@@ -557,7 +688,7 @@ class DroneControllerNode(Node):
             self._task.task_id, 'ABORTED',
             cmd.sequence   if cmd else 0,
             cmd.command_id if cmd else '',
-            'FAILED',
+            CMD_FAILED,
             len(self._cmds), self._cidx, reason)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -566,14 +697,25 @@ class DroneControllerNode(Node):
         return self.get_clock().now().nanoseconds // 1000
 
     def _stream_offboard(self):
+        """Publish OffboardControlMode + TrajectorySetpoint at the loop rate.
+        PX4 requires a continuous setpoint stream before and during OFFBOARD;
+        drop below ~2 Hz and PX4 exits OFFBOARD as a safety failsafe."""
         ocm = OffboardControlMode()
-        ocm.position  = True
-        ocm.velocity  = ocm.acceleration = ocm.attitude = ocm.body_rate = False
-        ocm.timestamp = self._ts()
+        ocm.position     = True
+        ocm.velocity     = False
+        ocm.acceleration = False
+        ocm.attitude     = False
+        ocm.body_rate    = False
+        ocm.timestamp    = self._ts()
         self._pub_offboard.publish(ocm)
+
         sp = TrajectorySetpoint()
-        sp.position  = [float(v) for v in self._ob_target]
-        sp.yaw       = float('nan')
+        sp.position = [float(v) for v in self._ob_target_ned]
+        sp.velocity = [float('nan')] * 3
+        sp.acceleration = [float('nan')] * 3
+        sp.jerk = [float('nan')] * 3
+        sp.yaw       = float(self._ob_yaw)
+        sp.yawspeed  = float('nan')
         sp.timestamp = self._ts()
         self._pub_trajectory.publish(sp)
 

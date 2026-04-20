@@ -1,26 +1,53 @@
 #!/usr/bin/env python3
 """
 test_task_publish.py
-VTP Robotics — MQTT task test publisher
+VTP Robotics — MQTT task test publisher (EMQX-ready)
 
-SITL home from vehicle_gps_position:
-  lat=37.412173210128394  lon=-121.99887844299644  alt_msl=38.175m
+Publishes tasks to the mqtt_bridge over MQTT using the current envelope:
+  metadata.task_id, tenant_id, drone_id, drone_serial, type="command"
+  payload = [ { sequence, command_id, command_type, payload: {...} } ]
 
-Task 1: TAKEOFF 50m → GO_TO 50m north → LAND
-Task 2: TAKEOFF 50m → GO_TO back to home → LAND
+Subscribes to task_status to show progress back.
+
+Default broker:
+  wss://dev-lae-mqtt.viettelpost.vn:443/mqtt   (EMQX via HAProxy)
+
+SITL home (PX4 Gazebo default, used by forward/backward tasks):
+  lat=37.41217321  lon=-121.99887844  alt_msl=38.175 m
 
 Usage:
-  python3 test_task_publish.py --task 1
-  python3 test_task_publish.py --task 2
-  python3 test_task_publish.py --error-test   # missing altitude → ABORTED
-  python3 test_task_publish.py --host 100.x.x.x  # remote broker
+  # Individual tasks
+  python3 test_task_publish.py --task takeoff
+  python3 test_task_publish.py --task goto_north
+  python3 test_task_publish.py --task goto_home
+  python3 test_task_publish.py --task pause_continue
+  python3 test_task_publish.py --task rth
+  python3 test_task_publish.py --task land
+
+  # Combined mission
+  python3 test_task_publish.py --task combined
+
+  # Negative tests
+  python3 test_task_publish.py --task error_no_altitude
+  python3 test_task_publish.py --task error_wrong_tenant
+  python3 test_task_publish.py --task error_wrong_serial
+
+  # Override broker (local EMQX)
+  python3 test_task_publish.py --task takeoff \\
+      --host localhost --port 1883 --transport tcp --no-tls
+
+  # Override identity
+  python3 test_task_publish.py --task takeoff \\
+      --tenant Hanoi --drone-id drone_01 --drone-serial SN000001
 """
 
 import argparse
 import json
 import math
-import time
+import ssl
 import sys
+import time
+import uuid
 
 try:
     import paho.mqtt.client as mqtt
@@ -29,208 +56,372 @@ except ImportError:
     sys.exit(1)
 
 # ── SITL home ────────────────────────────────────────────────────────────────
-HOME_LAT  = 37.412173210128394
-HOME_LON  = -121.99887844299644
-HOME_AMSL = 38.175
+HOME_LAT = 37.412173210128394
+HOME_LON = -121.99887844299644
 
 FORWARD_M = 50.0
 NORTH_LAT = HOME_LAT + math.degrees(FORWARD_M / 6_371_000.0)
-NORTH_LON = HOME_LON   # due north
+NORTH_LON = HOME_LON  # due north
 
-# ── Config ───────────────────────────────────────────────────────────────────
-MQTT_HOST = '100.104.34.77'
-MQTT_PORT = 1883
-TENANT_ID = 'Hanoi'
-DRONE_ID  = 'drone_01'
-CMD_TOPIC = f'drone/{TENANT_ID}/{DRONE_ID}/task_command'
-STA_TOPIC = f'drone/{TENANT_ID}/{DRONE_ID}/task_status'
+# ── Default broker (EMQX via HAProxy) ────────────────────────────────────────
+DEFAULT_HOST      = 'dev-lae-mqtt.viettelpost.vn'
+DEFAULT_PORT      = 443
+DEFAULT_TRANSPORT = 'websockets'
+DEFAULT_WS_PATH   = '/mqtt'
+DEFAULT_USERNAME  = 'dungpt64'
+DEFAULT_PASSWORD  = 'v12345678'
+DEFAULT_TLS       = True
+
+# ── Default drone identity (must match bridge config) ────────────────────────
+DEFAULT_TENANT       = 'Hanoi'
+DEFAULT_DRONE_ID     = 'drone_01'
+DEFAULT_DRONE_SERIAL = 'SN000001'
 
 
-def ts() -> str:
-    return str(int(time.time() * 1000))
+# ── Envelope builder ─────────────────────────────────────────────────────────
 
-
-def make_task(task_id, commands):
+def make_envelope(task_id, tenant_id, drone_id, drone_serial, commands):
     return {
-        "header": {
-            "task_id":          task_id,
-            "tenant_id":        TENANT_ID,
-            "drone_id":         DRONE_ID,
-            "drone_serial":     "SN000001",
-            "type":             "task_command",
-            "protocol_version": "1.0",
-            "timestamp":        ts(),
+        'event_id':  f'evt-{uuid.uuid4()}',
+        'timestamp': int(time.time() * 1000),
+        'metadata': {
+            'task_id':      task_id,
+            'tenant_id':    tenant_id,
+            'drone_id':     drone_id,
+            'drone_serial': drone_serial,
+            'type':         'command',
         },
-        "payloads": commands,
+        'payload': commands,
     }
 
 
-def takeoff_cmd(seq, task_id, alt_m):
-    return {
-        "sequence":     seq,
-        "command_id":   f'{task_id}-{seq:03d}',
-        "command_type": "TAKEOFF",
-        "payload": {
-            "latitude": 0.0, "longitude": 0.0,
-            "altitude_m": alt_m, "altitude_ref": "home",
-            "speed_ms": 0.0, "arrival_radius_m": 0.0,
-            "has_position": False, "has_altitude": True,
-            "has_speed": False, "has_arrival_radius": False,
-        },
-    }
+# ── Command builders (new simplified payload format) ─────────────────────────
 
-
-def goto_cmd(seq, task_id, lat, lon, alt_m, speed=5.0, arrival_r=2.0):
+def takeoff(seq, task_id, alt_m, speed=None):
     return {
-        "sequence":     seq,
-        "command_id":   f'{task_id}-{seq:03d}',
-        "command_type": "GO_TO",
-        "payload": {
-            "latitude": lat, "longitude": lon,
-            "altitude_m": alt_m, "altitude_ref": "home",
-            "speed_ms": speed, "arrival_radius_m": arrival_r,
-            "has_position": True, "has_altitude": True,
-            "has_speed": True, "has_arrival_radius": True,
+        'sequence':     seq,
+        'command_id':   f'{task_id}-{seq:03d}',
+        'command_type': 'TAKE_OFF',
+        'payload': {
+            'latitude':  None,
+            'longitude': None,
+            'altitude':  alt_m,
+            'speed':     speed,
         },
     }
 
 
-def land_cmd(seq, task_id):
+def goto(seq, task_id, lat, lon, alt_m, speed=5.0):
     return {
-        "sequence":     seq,
-        "command_id":   f'{task_id}-{seq:03d}',
-        "command_type": "LAND",
-        "payload": {
-            "latitude": 0.0, "longitude": 0.0,
-            "altitude_m": 0.0, "altitude_ref": "",
-            "speed_ms": 0.0, "arrival_radius_m": 0.0,
-            "has_position": False, "has_altitude": False,
-            "has_speed": False, "has_arrival_radius": False,
+        'sequence':     seq,
+        'command_id':   f'{task_id}-{seq:03d}',
+        'command_type': 'GO_TO',
+        'payload': {
+            'latitude':  lat,
+            'longitude': lon,
+            'altitude':  alt_m,
+            'speed':     speed,
         },
     }
 
 
-def task_forward():
-    tid = "TASK_FWD_001"
-    print(f'\nTask 1: TAKEOFF 50m → GO_TO {FORWARD_M}m north → LAND')
-    print(f'  Home:   {HOME_LAT:.6f}, {HOME_LON:.6f}')
-    print(f'  Target: {NORTH_LAT:.6f}, {NORTH_LON:.6f}')
-    return make_task(tid, [
-        takeoff_cmd(1, tid, 50.0),
-        goto_cmd(2, tid, NORTH_LAT, NORTH_LON, 50.0, speed=5.0, arrival_r=2.0),
-        land_cmd(3, tid),
-    ])
-
-
-def task_backward():
-    tid = "TASK_BCK_001"
-    print(f'\nTask 2: TAKEOFF 50m → GO_TO home → LAND')
-    print(f'  From:   {NORTH_LAT:.6f}, {NORTH_LON:.6f}')
-    print(f'  Home:   {HOME_LAT:.6f}, {HOME_LON:.6f}')
-    return make_task(tid, [
-        takeoff_cmd(1, tid, 50.0),
-        goto_cmd(2, tid, HOME_LAT, HOME_LON, 50.0, speed=5.0, arrival_r=2.0),
-        land_cmd(3, tid),
-    ])
-
-
-def task_error():
-    tid = "TASK_ERR_001"
-    print(f'\n[TEST] Error task: TAKEOFF with no altitude → should ABORT')
-    return make_task(tid, [{
-        "sequence": 1,
-        "command_id": f'{tid}-001',
-        "command_type": "TAKEOFF",
-        "payload": {
-            "latitude": 0.0, "longitude": 0.0,
-            "altitude_m": 0.0, "altitude_ref": "",
-            "speed_ms": 0.0, "arrival_radius_m": 0.0,
-            "has_position": False, "has_altitude": False,  # ← missing!
-            "has_speed": False, "has_arrival_radius": False,
+def pause(seq, task_id):
+    return {
+        'sequence':     seq,
+        'command_id':   f'{task_id}-{seq:03d}',
+        'command_type': 'PAUSE',
+        'payload': {
+            'latitude': None, 'longitude': None,
+            'altitude': None, 'speed': 0.0,
         },
-    }])
+    }
 
 
-def connect(host, port):
-    client = mqtt.Client(client_id='vtp_test', protocol=mqtt.MQTTv311)
-    client.connect(host, port, keepalive=30)
-    client.loop_start()
+def cont(seq, task_id, speed=5.0):
+    return {
+        'sequence':     seq,
+        'command_id':   f'{task_id}-{seq:03d}',
+        'command_type': 'CONTINUE',
+        'payload': {
+            'latitude': None, 'longitude': None,
+            'altitude': None, 'speed': speed,
+        },
+    }
 
-    def on_message(c, ud, msg):
+
+def rth(seq, task_id, alt_m=50.0, speed=5.0):
+    return {
+        'sequence':     seq,
+        'command_id':   f'{task_id}-{seq:03d}',
+        'command_type': 'RETURN_TO_HOME',
+        'payload': {
+            'latitude':  None,
+            'longitude': None,
+            'altitude':  alt_m,
+            'speed':     speed,
+        },
+    }
+
+
+def land(seq, task_id):
+    return {
+        'sequence':     seq,
+        'command_id':   f'{task_id}-{seq:03d}',
+        'command_type': 'LAND',
+        'payload': {
+            'latitude':  None,
+            'longitude': None,
+            'altitude':  0.0,
+            'speed':     1.0,
+        },
+    }
+
+
+# ── Task presets ─────────────────────────────────────────────────────────────
+
+def task_takeoff(cfg):
+    tid = 'TASK_TAKEOFF_001'
+    print(f'\n[Task] TAKE_OFF 20 m → hold')
+    return tid, [takeoff(1, tid, 20.0)]
+
+
+def task_goto_north(cfg):
+    tid = 'TASK_GOTO_NORTH_001'
+    print(f'\n[Task] TAKE_OFF 30 m → GO_TO {FORWARD_M} m north')
+    print(f'       target: {NORTH_LAT:.6f}, {NORTH_LON:.6f}')
+    return tid, [
+        takeoff(1, tid, 30.0),
+        goto(2, tid, NORTH_LAT, NORTH_LON, 30.0, speed=5.0),
+    ]
+
+
+def task_goto_home(cfg):
+    tid = 'TASK_GOTO_HOME_001'
+    print(f'\n[Task] GO_TO home  (expects drone already airborne)')
+    return tid, [
+        goto(1, tid, HOME_LAT, HOME_LON, 30.0, speed=5.0),
+    ]
+
+
+def task_pause_continue(cfg):
+    tid = 'TASK_PAUSE_001'
+    print(f'\n[Task] TAKE_OFF 30 m → GO_TO north → PAUSE → CONTINUE → GO_TO home')
+    return tid, [
+        takeoff(1, tid, 30.0),
+        goto(2, tid, NORTH_LAT, NORTH_LON, 30.0, speed=5.0),
+        pause(3, tid),
+        cont(4, tid, speed=5.0),
+        goto(5, tid, HOME_LAT, HOME_LON, 30.0, speed=5.0),
+    ]
+
+
+def task_rth(cfg):
+    tid = 'TASK_RTH_001'
+    print(f'\n[Task] RETURN_TO_HOME  (expects drone already airborne)')
+    return tid, [rth(1, tid, alt_m=50.0, speed=5.0)]
+
+
+def task_land(cfg):
+    tid = 'TASK_LAND_001'
+    print(f'\n[Task] LAND  (expects drone already airborne)')
+    return tid, [land(1, tid)]
+
+
+def task_combined(cfg):
+    tid = 'TASK_COMBINED_001'
+    print(f'\n[Task] COMBINED: TAKE_OFF → GO_TO north → GO_TO home → RTH')
+    print(f'       north target: {NORTH_LAT:.6f}, {NORTH_LON:.6f}')
+    return tid, [
+        takeoff(1, tid, 40.0),
+        goto(2, tid, NORTH_LAT, NORTH_LON, 40.0, speed=6.0),
+        goto(3, tid, HOME_LAT, HOME_LON, 40.0, speed=6.0),
+        rth(4, tid, alt_m=50.0, speed=5.0),
+    ]
+
+
+# ── Negative tests ───────────────────────────────────────────────────────────
+
+def task_error_no_altitude(cfg):
+    tid = 'TASK_ERR_ALT_001'
+    print(f'\n[Test] TAKE_OFF with altitude=null → controller should ABORT')
+    return tid, [{
+        'sequence':     1,
+        'command_id':   f'{tid}-001',
+        'command_type': 'TAKE_OFF',
+        'payload': {
+            'latitude': None, 'longitude': None,
+            'altitude': None, 'speed': 0.0,
+        },
+    }]
+
+
+def task_error_wrong_tenant(cfg):
+    """Bridge should reject with ABORTED because tenant_id mismatches."""
+    tid = 'TASK_ERR_TENANT_001'
+    print(f'\n[Test] tenant_id mismatch → bridge should REJECT (ABORTED)')
+    cfg['override_tenant'] = 'WRONG_TENANT'
+    return tid, [takeoff(1, tid, 20.0)]
+
+
+def task_error_wrong_serial(cfg):
+    """Bridge should reject with ABORTED because drone_serial mismatches."""
+    tid = 'TASK_ERR_SERIAL_001'
+    print(f'\n[Test] drone_serial mismatch → bridge should REJECT (ABORTED)')
+    cfg['override_serial'] = 'SN_WRONG'
+    return tid, [takeoff(1, tid, 20.0)]
+
+
+TASKS = {
+    'takeoff':            task_takeoff,
+    'goto_north':         task_goto_north,
+    'goto_home':          task_goto_home,
+    'pause_continue':     task_pause_continue,
+    'rth':                task_rth,
+    'land':               task_land,
+    'combined':           task_combined,
+    'error_no_altitude':  task_error_no_altitude,
+    'error_wrong_tenant': task_error_wrong_tenant,
+    'error_wrong_serial': task_error_wrong_serial,
+}
+
+
+# ── MQTT client ──────────────────────────────────────────────────────────────
+
+def build_client(args):
+    client = mqtt.Client(
+        client_id=f'vtp_test_{int(time.time())}',
+        protocol=mqtt.MQTTv5,
+        transport=args.transport,
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    )
+    if args.username:
+        client.username_pw_set(args.username, args.password)
+    if args.transport == 'websockets':
+        client.ws_set_options(path=args.ws_path)
+    if args.tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         try:
-            data = json.loads(msg.payload)
-            pl = data.get('payloads', data)
-            print(f'  [STATUS] task={pl.get("task_status","?")}  '
-                  f'seq={pl.get("current_sequence","?")}  '
-                  f'cmd={pl.get("current_command_id","?")}  '
-                  f'cmd_status={pl.get("command_status","?")}  '
-                  f'wp={pl.get("waypoints_done","?")}/{pl.get("waypoints_total","?")}'
-                  + (f'  reason={pl["abort_reason"]}' if pl.get('abort_reason') else ''))
-        except Exception as e:
-            print(f'  [STATUS parse error] {e}')
-
-    client.subscribe(STA_TOPIC, qos=1)
-    client.on_message = on_message
-    print(f'[MQTT] {host}:{port}  cmd→{CMD_TOPIC}  status←{STA_TOPIC}')
-    time.sleep(0.3)
+            import certifi
+            ctx.load_verify_locations(certifi.where())
+        except ImportError:
+            ctx.load_default_certs()
+        client.tls_set_context(ctx)
     return client
 
 
-def pub(client, task):
-    tid  = task['header']['task_id']
-    result = client.publish(CMD_TOPIC, json.dumps(task), qos=1)
-    result.wait_for_publish(timeout=5)
-    cmds = task['payloads']
-    print(f'[PUB] {tid}  ({len(cmds)} commands):')
+def on_task_status(c, ud, msg):
+    try:
+        data = json.loads(msg.payload)
+        md = data.get('metadata', {}) or {}
+        pl = data.get('payload',  {}) or {}
+        task_id = md.get('task_id', '?')
+        print(
+            f'  [STATUS] task={task_id}  '
+            f'state={pl.get("task_status","?")}  '
+            f'seq={pl.get("current_sequence","?")}  '
+            f'cmd={pl.get("current_command_id","?")}  '
+            f'cmd_status={pl.get("command_status","?")}  '
+            f'done={pl.get("commands_done","?")}/{pl.get("commands_total","?")}'
+            + (f'  reason={pl["abort_reason"]}' if pl.get('abort_reason') else '')
+        )
+    except Exception as e:
+        print(f'  [STATUS parse error] {e}  raw={msg.payload!r}')
+
+
+def connect(args):
+    client = build_client(args)
+    client.on_message = on_task_status
+    client.connect(args.host, args.port, keepalive=30)
+    client.loop_start()
+
+    # Subscribe to task_status for the bridge we're targeting
+    status_topic = f'drone/{args.tenant}/{args.drone_serial}/task_status'
+    client.subscribe(status_topic, qos=1)
+    print(f'[MQTT] {args.host}:{args.port}  transport={args.transport}  '
+          f'tls={args.tls}')
+    print(f'       status ← {status_topic}')
+    time.sleep(0.5)
+    return client
+
+
+def publish(client, args, cfg, envelope):
+    tenant = cfg.get('override_tenant', args.tenant)
+    serial = cfg.get('override_serial', args.drone_serial)
+    cmd_topic = f'drone/{tenant}/{serial}/task_command'
+
+    # If we're deliberately testing wrong identity, still publish to the
+    # bridge's real topic so the bridge receives and rejects it.
+    real_topic = f'drone/{args.tenant}/{args.drone_serial}/task_command'
+    pub_topic = real_topic
+    if cfg.get('override_tenant') or cfg.get('override_serial'):
+        # keep topic at real bridge topic; envelope metadata carries wrong id
+        envelope['metadata']['tenant_id']    = tenant
+        envelope['metadata']['drone_serial'] = serial
+
+    tid  = envelope['metadata']['task_id']
+    cmds = envelope['payload']
+    print(f'[PUB] {tid} → {pub_topic}  ({len(cmds)} commands)')
     for c in cmds:
         pl = c['payload']
-        line = f'  seq={c["sequence"]}  {c["command_type"]}'
-        if pl['has_position']:
-            line += f'  lat={pl["latitude"]:.6f} lon={pl["longitude"]:.6f}'
-        if pl['has_altitude']:
-            line += f'  alt={pl["altitude_m"]}m ({pl["altitude_ref"]})'
-        if pl['has_speed']:
-            line += f'  speed={pl["speed_ms"]}m/s'
+        line = f'      seq={c["sequence"]}  {c["command_type"]}'
+        if pl.get('latitude')  is not None: line += f'  lat={pl["latitude"]:.6f}'
+        if pl.get('longitude') is not None: line += f'  lon={pl["longitude"]:.6f}'
+        if pl.get('altitude')  is not None: line += f'  alt={pl["altitude"]}m'
+        if pl.get('speed')     is not None: line += f'  speed={pl["speed"]}m/s'
         print(line)
 
+    result = client.publish(pub_topic, json.dumps(envelope), qos=1)
+    result.wait_for_publish(timeout=5)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--host',       default=MQTT_HOST)
-    ap.add_argument('--port',       type=int, default=MQTT_PORT)
-    ap.add_argument('--task',       type=int, default=0,
-                    help='1=forward 2=backward 0=both')
-    ap.add_argument('--error-test', action='store_true')
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__)
+    ap.add_argument('--task', required=True, choices=sorted(TASKS.keys()),
+                    help='Task preset to publish')
+    ap.add_argument('--wait', type=float, default=120.0,
+                    help='Seconds to listen for task_status after publish')
+    ap.add_argument('--host',         default=DEFAULT_HOST)
+    ap.add_argument('--port',         type=int, default=DEFAULT_PORT)
+    ap.add_argument('--transport',    default=DEFAULT_TRANSPORT,
+                    choices=['tcp', 'websockets'])
+    ap.add_argument('--ws-path',      default=DEFAULT_WS_PATH)
+    ap.add_argument('--username',     default=DEFAULT_USERNAME)
+    ap.add_argument('--password',     default=DEFAULT_PASSWORD)
+    ap.add_argument('--tls',          dest='tls', action='store_true',
+                    default=DEFAULT_TLS)
+    ap.add_argument('--no-tls',       dest='tls', action='store_false')
+    ap.add_argument('--tenant',       default=DEFAULT_TENANT)
+    ap.add_argument('--drone-id',     default=DEFAULT_DRONE_ID)
+    ap.add_argument('--drone-serial', default=DEFAULT_DRONE_SERIAL)
     args = ap.parse_args()
 
-    client = connect(args.host, args.port)
+    cfg = {}
+    task_id, commands = TASKS[args.task](cfg)
 
-    if args.error_test:
-        pub(client, task_error())
-        time.sleep(5)
-    elif args.task == 1:
-        pub(client, task_forward())
-        print('Waiting 120s for completion...')
-        time.sleep(120)
-    elif args.task == 2:
-        pub(client, task_backward())
-        print('Waiting 120s for completion...')
-        time.sleep(120)
-    else:
-        pub(client, task_forward())
-        print('\nTask 1 sent. Press Enter when drone has landed before sending Task 2...')
-        try:
-            input()
-        except EOFError:
-            time.sleep(90)
-        time.sleep(2)
-        pub(client, task_backward())
-        print('Waiting 120s...')
-        time.sleep(120)
+    client = connect(args)
+    envelope = make_envelope(
+        task_id=task_id,
+        tenant_id=args.tenant,
+        drone_id=args.drone_id,
+        drone_serial=args.drone_serial,
+        commands=commands,
+    )
+    publish(client, args, cfg, envelope)
 
-    print('[DONE]')
+    print(f'[WAIT] Listening {args.wait:.0f}s for task_status...')
+    try:
+        time.sleep(args.wait)
+    except KeyboardInterrupt:
+        print('[INT] stopping')
+
     client.loop_stop()
     client.disconnect()
+    print('[DONE]')
 
 
 if __name__ == '__main__':

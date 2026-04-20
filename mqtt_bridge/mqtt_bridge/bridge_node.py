@@ -21,8 +21,9 @@ state to new subscribers.
 Envelope added to every outbound MQTT message:
   {
     "event_id":  "<uuid4>",
-    "timestamp": { "date": "YYYY-MM-DD", "time": "HH:MM:SS.mmm" },
-    "metadata":  { "tenant_id", "drone_id", "drone_serial", "type" },
+    "timestamp": "YYYY-MM-DDTHH:MM:SS.mmmZ",
+    "metadata":  { "tenant_id", "drone_id", "drone_serial", "type",
+                   "task_id" (task_status only) },
     "payload":   { ... }
   }
 """
@@ -62,7 +63,7 @@ _RELIABLE = QoSProfile(
 )
 
 # Task statuses that mark end of an active task (clears _in_task).
-_TERMINAL_TASK_STATUSES = {"COMPLETED", "FAILED", "ABORTED", "REJECTED", "CANCELLED"}
+_TERMINAL_TASK_STATUSES = {"COMPLETED", "FAILED", "ABORTED", "REJECTED", "CANCELED", "CANCELLED"}
 
 
 class MQTTBridgeNode(Node):
@@ -214,9 +215,12 @@ class MQTTBridgeNode(Node):
             self._pub_counts["alarm"] += 1
 
     def _timer_publish_task_status(self) -> None:
-        """1 Hz — publish cached TaskStatus (null fields with in_task=False if no task)."""
+        """1 Hz — publish cached TaskStatus (null fields with in_task=False if no task).
+        task_id lives in metadata (not in payload) per protocol."""
         payload = serializers.task_status(self._last_task_status, in_task=self._in_task)
-        envelope = self._make_envelope("task_status", payload)
+        task_id = (self._last_task_status.task_id
+                   if self._last_task_status is not None else "")
+        envelope = self._make_envelope("task_status", payload, task_id=task_id)
         if self._mqtt.publish(self._t_task_status, envelope, qos=1, retain=True):
             self._pub_counts["task_status"] += 1
 
@@ -240,12 +244,24 @@ class MQTTBridgeNode(Node):
         """
         Receive task_command from MQTT, validate, publish to ROS2.
 
+        Envelope (new format):
+          {
+            "event_id": "...",
+            "timestamp": <epoch_ms>,
+            "metadata": {
+              "task_id", "tenant_id", "drone_id", "drone_serial", "type"
+            },
+            "payload": [ { sequence, command_id, command_type,
+                           payload: { latitude, longitude, altitude, speed } }, ... ]
+          }
+
         Validation:
           1. Valid JSON
-          2. Required fields present in metadata + payloads[]
-          3. drone_id matches this bridge's configured drone_id
-          4. payloads[] is non-empty
-          5. Duplicate task_id check (MQTT QoS-1 can deliver twice)
+          2. metadata.task_id / tenant_id / drone_serial / type present
+          3. tenant_id AND drone_serial must match this bridge's config
+             (mismatch → ABORTED task_status with reason)
+          4. payload is a non-empty list
+          5. Duplicate task_id drop (MQTT QoS-1 re-delivery)
         """
         try:
             data = json.loads(raw)
@@ -254,26 +270,21 @@ class MQTTBridgeNode(Node):
             self._publish_rejection("unknown", f"invalid_json: {e}")
             return
 
-        event_id         = data.get("event_id", "")
-        timestamp        = data.get("timestamp", "")
-        metadata         = data.get("metadata", {})
-        task_id          = metadata.get("task_id", "")
-        tenant_id        = metadata.get("tenant_id", "")
-        drone_id         = metadata.get("drone_id", "")
-        drone_serial     = metadata.get("drone_serial", "")
-        msg_type         = metadata.get("type", "")
-        protocol_version = metadata.get("protocol_version", "")
-        payloads         = data.get("payloads", [])
+        event_id     = data.get("event_id", "")
+        timestamp    = data.get("timestamp", "")
+        metadata     = data.get("metadata", {}) or {}
+        task_id      = metadata.get("task_id", "")
+        tenant_id    = metadata.get("tenant_id", "")
+        drone_id     = metadata.get("drone_id", "")
+        drone_serial = metadata.get("drone_serial", "")
+        msg_type     = metadata.get("type", "")
+        commands     = data.get("payload", [])
 
-        # Validation
         if not task_id:
             self._publish_rejection("unknown", "missing metadata.task_id")
             return
         if not tenant_id:
             self._publish_rejection(task_id, "missing metadata.tenant_id")
-            return
-        if not drone_id:
-            self._publish_rejection(task_id, "missing metadata.drone_id")
             return
         if not drone_serial:
             self._publish_rejection(task_id, "missing metadata.drone_serial")
@@ -281,25 +292,22 @@ class MQTTBridgeNode(Node):
         if not msg_type:
             self._publish_rejection(task_id, "missing metadata.type")
             return
-        if not protocol_version:
-            self._publish_rejection(task_id, "missing metadata.protocol_version")
-            return
-        if protocol_version != "1.0":
-            self._publish_rejection(task_id, f"unsupported protocol_version='{protocol_version}'")
-            return
-        if not msg_type.startswith("task_command"):
-            self._publish_rejection(task_id, f"invalid metadata.type='{msg_type}'")
-            return
-        if not isinstance(payloads, list) or len(payloads) == 0:
-            self._publish_rejection(task_id, "payloads must be a non-empty list")
+        if not isinstance(commands, list) or len(commands) == 0:
+            self._publish_rejection(task_id, "payload must be a non-empty list of commands")
             return
 
-        # Identity check
-        if drone_id != self._drone_id:
-            logger.warning(
-                f"task_command rejected: drone_id='{drone_id}' "
-                f"!= configured='{self._drone_id}'"
-            )
+        # Identity check: tenant_id AND drone_serial must match configured
+        if tenant_id != self._tenant_id:
+            reason = (f"tenant_id mismatch: got='{tenant_id}' "
+                      f"expected='{self._tenant_id}'")
+            logger.warning(f"task_command {task_id} rejected: {reason}")
+            self._publish_rejection(task_id, reason)
+            return
+        if drone_serial != self._drone_serial:
+            reason = (f"drone_serial mismatch: got='{drone_serial}' "
+                      f"expected='{self._drone_serial}'")
+            logger.warning(f"task_command {task_id} rejected: {reason}")
+            self._publish_rejection(task_id, reason)
             return
 
         # Duplicate check (MQTT QoS-1 re-delivery)
@@ -309,7 +317,8 @@ class MQTTBridgeNode(Node):
         self._last_task_id = task_id
 
         # Build drone_msgs/TaskCommand
-        ros_msg = self._build_task_command_msg(metadata, timestamp, payloads)
+        ros_msg = self._build_task_command_msg(
+            task_id, tenant_id, drone_id, timestamp, commands)
         if ros_msg is None:
             self._publish_rejection(task_id, "failed to parse command items")
             return
@@ -317,7 +326,7 @@ class MQTTBridgeNode(Node):
         self._pub_task_command.publish(ros_msg)
         self._in_task = True
         logger.info(f"task_command '{task_id}' (event_id={event_id}) forwarded to "
-                    f"/mqtt_bridge/out/task_command ({len(payloads)} commands)")
+                    f"/mqtt_bridge/out/task_command ({len(commands)} commands)")
 
         # Acknowledge to cloud: bridge received and forwarded the command.
         # Seeds _last_task_status so the next task_status timer publishes RECEIVED.
@@ -327,50 +336,50 @@ class MQTTBridgeNode(Node):
             current_sequence=0,
             current_command_id="",
             command_status="PENDING",
-            total=len(payloads),
+            total=len(commands),
             done=0,
         )
 
-    def _build_task_command_msg(self, metadata: dict, timestamp,
-                                payloads: list) -> TaskCommand:
-        """Parse metadata + payloads into drone_msgs/TaskCommand. Returns None on failure."""
+    def _build_task_command_msg(self, task_id, tenant_id, drone_id,
+                                timestamp, commands: list) -> TaskCommand:
+        """Parse metadata + commands into drone_msgs/TaskCommand. Returns None on failure."""
         try:
             msg = TaskCommand()
-            msg.task_id          = str(metadata.get("task_id", ""))
-            msg.tenant_id        = str(metadata.get("tenant_id", ""))
-            msg.drone_id         = str(metadata.get("drone_id", ""))
+            msg.task_id          = str(task_id)
+            msg.tenant_id        = str(tenant_id)
+            msg.drone_id         = str(drone_id)
             msg.timestamp        = str(timestamp) if timestamp else ""
-            msg.protocol_version = str(metadata.get("protocol_version", "1.0"))
+            msg.protocol_version = "1.0"
 
-            for item in payloads:
+            for item in commands:
                 ci = CommandItem()
                 ci.sequence     = int(item.get("sequence", 0))
                 ci.command_id   = str(item.get("command_id", ""))
                 ci.command_type = str(item.get("command_type", ""))
 
-                pl = item.get("payload", {})
+                pl = item.get("payload", {}) or {}
                 cp = CommandPayload()
 
-                if pl.get("latitude") is not None:
-                    cp.latitude     = float(pl["latitude"])
-                    cp.longitude    = float(pl["longitude"])
+                lat = pl.get("latitude")
+                lon = pl.get("longitude")
+                if lat is not None and lon is not None:
+                    cp.latitude     = float(lat)
+                    cp.longitude    = float(lon)
                     cp.has_position = True
 
-                if pl.get("altitude_m") is not None:
-                    cp.altitude_m   = float(pl["altitude_m"])
-                    cp.altitude_ref = str(pl.get("altitude_ref", "home"))
+                alt = pl.get("altitude")
+                if alt is not None:
+                    cp.altitude_m   = float(alt)
+                    cp.altitude_ref = "home"
                     cp.has_altitude = True
 
-                if pl.get("speed_ms") is not None:
-                    cp.speed_ms     = float(pl["speed_ms"])
-                    cp.has_speed    = True
-
-                if pl.get("arrival_radius_m") is not None:
-                    cp.arrival_radius_m   = float(pl["arrival_radius_m"])
-                    cp.has_arrival_radius = True
+                spd = pl.get("speed")
+                if spd is not None:
+                    cp.speed_ms  = float(spd)
+                    cp.has_speed = True
 
                 ci.payload = cp
-                msg.payloads.append(cp if False else ci)
+                msg.payloads.append(ci)
 
             return msg
         except (KeyError, TypeError, ValueError) as e:
@@ -379,28 +388,33 @@ class MQTTBridgeNode(Node):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _make_metadata(self, msg_type: str) -> dict:
-        return {
+    def _make_metadata(self, msg_type: str, task_id: Optional[str] = None) -> dict:
+        md = {
             "tenant_id":    self._tenant_id,
             "drone_id":     self._drone_id,
             "drone_serial": self._drone_serial,
             "type":         msg_type,
         }
+        if task_id is not None:
+            md["task_id"] = task_id
+        return md
 
-    def _make_envelope(self, msg_type: str, payload) -> dict:
+    def _make_envelope(self, msg_type: str, payload, task_id: Optional[str] = None) -> dict:
         now = datetime.now(timezone.utc)
         return {
             "event_id":  str(uuid.uuid4()),
             "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond//1000:03d}Z",
-            "metadata": self._make_metadata(msg_type),
-            "payload":  payload,
+            "metadata":  self._make_metadata(msg_type, task_id=task_id),
+            "payload":   payload,
         }
 
     def _publish_rejection(self, task_id: str, reason: str) -> None:
-        logger.warning(f"task_command REJECTED: task_id='{task_id}' reason='{reason}'")
+        """Emit an ABORTED task_status with reason. Used when the bridge
+        refuses a task_command (bad envelope, identity mismatch, etc.)."""
+        logger.warning(f"task_command ABORTED: task_id='{task_id}' reason='{reason}'")
         self._in_task = False
         self._publish_task_status_update(
-            task_id=task_id, task_status="REJECTED",
+            task_id=task_id, task_status="ABORTED",
             current_sequence=0, current_command_id="",
             command_status="FAILED", total=0, done=0,
             abort_reason=reason,

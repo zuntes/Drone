@@ -202,27 +202,28 @@ def task_status(msg, in_task: bool) -> dict:
     """
     drone_msgs/TaskStatus → MQTT payload dict (or None msg → null sub-fields).
     `in_task` is bridge-side state: True when a task is currently active.
+
+    task_id is NOT part of the payload — it lives in the envelope metadata.
+    command_status values: PENDING | RUNNING | COMPLETED | FAILED | CANCELED.
     """
     if msg is None:
         return {
             "in_task":            in_task,
-            "task_id":            None,
             "task_status":        None,
             "current_sequence":   None,
             "current_command_id": None,
             "command_status":     None,
-            "waypoints_total":    None,
-            "waypoints_done":     None,
+            "commands_total":     None,
+            "commands_done":      None,
             "abort_reason":       None,
         }
     return {
         "in_task":            in_task,
-        "task_id":            msg.task_id,
         "task_status":        msg.task_status,
         "current_sequence":   msg.current_sequence,
         "current_command_id": msg.current_command_id,
         "command_status":     msg.command_status,
-        "waypoints_total":    msg.waypoints_total,
-        "waypoints_done":     msg.waypoints_done,
+        "commands_total":     msg.waypoints_total,
+        "commands_done":      msg.waypoints_done,
         "abort_reason":       msg.abort_reason if msg.abort_reason else None,
     }
