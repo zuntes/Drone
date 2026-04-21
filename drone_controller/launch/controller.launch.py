@@ -32,7 +32,7 @@ def generate_launch_description():
 
         # Node 2: Task executor
         # Subscribes to /mqtt_bridge/out/task_command
-        # Executes TAKEOFF/GO_TO/PAUSE/CONTINUE/RTH/LAND/ABORT
+        # Executes TAKE_OFF/GO_TO/RETURN_TO_HOME/LAND/CANCEL
         # Publishes progress to /mqtt_bridge/in/task_status
         Node(
             package='drone_controller',

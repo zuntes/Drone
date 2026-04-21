@@ -20,9 +20,12 @@ Usage:
   python3 test_task_publish.py --task takeoff
   python3 test_task_publish.py --task goto_north
   python3 test_task_publish.py --task goto_home
-  python3 test_task_publish.py --task pause_continue
   python3 test_task_publish.py --task rth
   python3 test_task_publish.py --task land
+
+  # CANCEL pre-emption
+  python3 test_task_publish.py --task cancel_only
+  python3 test_task_publish.py --task cancel_then_goto_home
 
   # Combined mission
   python3 test_task_publish.py --task combined
@@ -75,7 +78,7 @@ DEFAULT_TLS       = True
 # ── Default drone identity (must match bridge config) ────────────────────────
 DEFAULT_TENANT       = 'Hanoi'
 DEFAULT_DRONE_ID     = 'drone_01'
-DEFAULT_DRONE_SERIAL = 'SN000001'
+DEFAULT_DRONE_SERIAL = 'SN-000001'
 
 
 # ── Envelope builder ─────────────────────────────────────────────────────────
@@ -89,7 +92,7 @@ def make_envelope(task_id, tenant_id, drone_id, drone_serial, commands):
             'tenant_id':    tenant_id,
             'drone_id':     drone_id,
             'drone_serial': drone_serial,
-            'type':         'command',
+            'type':         'task_command',
         },
         'payload': commands,
     }
@@ -125,26 +128,14 @@ def goto(seq, task_id, lat, lon, alt_m, speed=5.0):
     }
 
 
-def pause(seq, task_id):
+def cancel(seq, task_id):
     return {
         'sequence':     seq,
         'command_id':   f'{task_id}-{seq:03d}',
-        'command_type': 'PAUSE',
+        'command_type': 'CANCEL',
         'payload': {
             'latitude': None, 'longitude': None,
-            'altitude': None, 'speed': 0.0,
-        },
-    }
-
-
-def cont(seq, task_id, speed=5.0):
-    return {
-        'sequence':     seq,
-        'command_id':   f'{task_id}-{seq:03d}',
-        'command_type': 'CONTINUE',
-        'payload': {
-            'latitude': None, 'longitude': None,
-            'altitude': None, 'speed': speed,
+            'altitude': None, 'speed': None,
         },
     }
 
@@ -203,15 +194,18 @@ def task_goto_home(cfg):
     ]
 
 
-def task_pause_continue(cfg):
-    tid = 'TASK_PAUSE_001'
-    print(f'\n[Task] TAKE_OFF 30 m → GO_TO north → PAUSE → CONTINUE → GO_TO home')
+def task_cancel_only(cfg):
+    tid = 'TASK_CANCEL_001'
+    print(f'\n[Task] CANCEL  (stop running task, hover)')
+    return tid, [cancel(1, tid)]
+
+
+def task_cancel_then_goto_home(cfg):
+    tid = 'TASK_CANCEL_GOTO_001'
+    print(f'\n[Task] CANCEL → GO_TO home  (pre-empt then fly home)')
     return tid, [
-        takeoff(1, tid, 30.0),
-        goto(2, tid, NORTH_LAT, NORTH_LON, 30.0, speed=5.0),
-        pause(3, tid),
-        cont(4, tid, speed=5.0),
-        goto(5, tid, HOME_LAT, HOME_LON, 30.0, speed=5.0),
+        cancel(1, tid),
+        goto(2, tid, HOME_LAT, HOME_LON, 30.0, speed=5.0),
     ]
 
 
@@ -243,7 +237,7 @@ def task_combined(cfg):
 
 def task_error_no_altitude(cfg):
     tid = 'TASK_ERR_ALT_001'
-    print(f'\n[Test] TAKE_OFF with altitude=null → controller should ABORT')
+    print(f'\n[Test] TAKE_OFF with altitude=null → controller should REJECT (FAILED)')
     return tid, [{
         'sequence':     1,
         'command_id':   f'{tid}-001',
@@ -256,32 +250,33 @@ def task_error_no_altitude(cfg):
 
 
 def task_error_wrong_tenant(cfg):
-    """Bridge should reject with ABORTED because tenant_id mismatches."""
+    """Bridge should reject with FAILED because tenant_id mismatches."""
     tid = 'TASK_ERR_TENANT_001'
-    print(f'\n[Test] tenant_id mismatch → bridge should REJECT (ABORTED)')
+    print(f'\n[Test] tenant_id mismatch → bridge should REJECT (FAILED)')
     cfg['override_tenant'] = 'WRONG_TENANT'
     return tid, [takeoff(1, tid, 20.0)]
 
 
 def task_error_wrong_serial(cfg):
-    """Bridge should reject with ABORTED because drone_serial mismatches."""
+    """Bridge should reject with FAILED because drone_serial mismatches."""
     tid = 'TASK_ERR_SERIAL_001'
-    print(f'\n[Test] drone_serial mismatch → bridge should REJECT (ABORTED)')
+    print(f'\n[Test] drone_serial mismatch → bridge should REJECT (FAILED)')
     cfg['override_serial'] = 'SN_WRONG'
     return tid, [takeoff(1, tid, 20.0)]
 
 
 TASKS = {
-    'takeoff':            task_takeoff,
-    'goto_north':         task_goto_north,
-    'goto_home':          task_goto_home,
-    'pause_continue':     task_pause_continue,
-    'rth':                task_rth,
-    'land':               task_land,
-    'combined':           task_combined,
-    'error_no_altitude':  task_error_no_altitude,
-    'error_wrong_tenant': task_error_wrong_tenant,
-    'error_wrong_serial': task_error_wrong_serial,
+    'takeoff':                task_takeoff,
+    'goto_north':             task_goto_north,
+    'goto_home':              task_goto_home,
+    'cancel_only':            task_cancel_only,
+    'cancel_then_goto_home':  task_cancel_then_goto_home,
+    'rth':                    task_rth,
+    'land':                   task_land,
+    'combined':               task_combined,
+    'error_no_altitude':      task_error_no_altitude,
+    'error_wrong_tenant':     task_error_wrong_tenant,
+    'error_wrong_serial':     task_error_wrong_serial,
 }
 
 

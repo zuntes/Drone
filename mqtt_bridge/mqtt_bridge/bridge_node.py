@@ -63,7 +63,7 @@ _RELIABLE = QoSProfile(
 )
 
 # Task statuses that mark end of an active task (clears _in_task).
-_TERMINAL_TASK_STATUSES = {"COMPLETED", "FAILED", "ABORTED", "REJECTED", "CANCELED", "CANCELLED"}
+_TERMINAL_TASK_STATUSES = {"COMPLETED", "FAILED", "CANCELED"}
 
 
 class MQTTBridgeNode(Node):
@@ -259,7 +259,7 @@ class MQTTBridgeNode(Node):
           1. Valid JSON
           2. metadata.task_id / tenant_id / drone_serial / type present
           3. tenant_id AND drone_serial must match this bridge's config
-             (mismatch → ABORTED task_status with reason)
+             (mismatch → FAILED task_status with reason)
           4. payload is a non-empty list
           5. Duplicate task_id drop (MQTT QoS-1 re-delivery)
         """
@@ -409,12 +409,12 @@ class MQTTBridgeNode(Node):
         }
 
     def _publish_rejection(self, task_id: str, reason: str) -> None:
-        """Emit an ABORTED task_status with reason. Used when the bridge
+        """Emit a FAILED task_status with reason. Used when the bridge
         refuses a task_command (bad envelope, identity mismatch, etc.)."""
-        logger.warning(f"task_command ABORTED: task_id='{task_id}' reason='{reason}'")
+        logger.warning(f"task_command REJECTED: task_id='{task_id}' reason='{reason}'")
         self._in_task = False
         self._publish_task_status_update(
-            task_id=task_id, task_status="ABORTED",
+            task_id=task_id, task_status="FAILED",
             current_sequence=0, current_command_id="",
             command_status="FAILED", total=0, done=0,
             abort_reason=reason,

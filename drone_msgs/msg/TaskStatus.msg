@@ -5,16 +5,16 @@
 # task_status values
 string TASK_RECEIVED="RECEIVED"
 string TASK_EXECUTING="EXECUTING"
-string TASK_PAUSED="PAUSED"
 string TASK_COMPLETED="COMPLETED"
 string TASK_FAILED="FAILED"
-string TASK_ABORTED="ABORTED"
+string TASK_CANCELED="CANCELED"
 
 # command_status values
 string CMD_PENDING="PENDING"
 string CMD_IN_PROGRESS="IN_PROGRESS"
 string CMD_COMPLETED="COMPLETED"
 string CMD_FAILED="FAILED"
+string CMD_CANCELED="CANCELED"
 
 string task_id
 string task_status
@@ -23,4 +23,4 @@ string current_command_id
 string command_status
 uint32 waypoints_total
 uint32 waypoints_done
-string abort_reason        # empty string if no abort reason
+string abort_reason        # empty string if no failure/cancel reason

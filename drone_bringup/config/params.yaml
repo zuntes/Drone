@@ -4,7 +4,7 @@ mqtt_bridge_node:
   ros__parameters:
     tenant_id:    "Hanoi"
     drone_id:     "drone_01"
-    drone_serial: "SN000001"
+    drone_serial: "SN-000001"
     # EMQX via HAProxy: wss://dev-lae-mqtt.viettelpost.vn:443/mqtt
     mqtt_host:       "dev-lae-mqtt.viettelpost.vn"
     mqtt_port:       443

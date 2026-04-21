@@ -13,10 +13,16 @@ Commands used
 ─────────────
   TAKE_OFF        → ARM + VEHICLE_CMD_NAV_TAKEOFF   (PX4 AUTO.TAKEOFF)
   GO_TO           → OFFBOARD + TrajectorySetpoint   (NED position)
-  PAUSE           → DO_SET_MODE → AUTO.LOITER (main=4 sub=3)
-  CONTINUE        → resume from paused cmd index
   RETURN_TO_HOME  → VEHICLE_CMD_NAV_RETURN_TO_LAUNCH (AUTO.RTL)
   LAND            → VEHICLE_CMD_NAV_LAND             (AUTO.LAND)
+  CANCEL          → stop current task, hover (AUTO.LOITER if airborne)
+
+CANCEL semantics
+────────────────
+A new task is normally rejected while another is running. CANCEL bypasses
+this gate: it may appear only as cmds[0] of an incoming task. On arrival
+it stops any in-flight command, marks the running task CANCELED, and the
+remaining commands of the new task execute on the now-hovering drone.
 
 TAKE_OFF uses VEHICLE_CMD_NAV_TAKEOFF (MAVLink 22): PX4 handles the
 takeoff ramp, yaw, and climb speed with its tuned controllers.
@@ -73,6 +79,7 @@ CMD_RUNNING    = 'RUNNING'
 CMD_COMPLETED  = 'COMPLETED'
 CMD_FAILED     = 'FAILED'
 CMD_CANCELED   = 'CANCELED'
+TASK_CANCELED  = 'CANCELED'
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -103,7 +110,6 @@ class Phase:
     CLIMBING     = 'CLIMBING'
     FLYING       = 'FLYING'
     WAITING      = 'WAITING'       # waiting for PX4 native cmd to finish
-    HOLDING      = 'HOLDING'       # PAUSED state
 
 
 class DroneControllerNode(Node):
@@ -266,19 +272,34 @@ class DroneControllerNode(Node):
     # ── Task ingestion ────────────────────────────────────────────────────────
 
     def _on_task_command(self, msg: TaskCommand):
-        if self._task_state not in ('IDLE', 'COMPLETED', 'ABORTED'):
+        cmds = sorted(msg.payloads, key=lambda c: c.sequence)
+        is_cancel_task = bool(cmds) and cmds[0].command_type == 'CANCEL'
+
+        busy = self._task_state not in ('IDLE', 'COMPLETED', 'FAILED', 'CANCELED')
+        if busy and not is_cancel_task:
             self.get_logger().warn(
-                f'Task {msg.task_id} ignored — '
-                f'{self._task.task_id} still {self._task_state}')
+                f'Task {msg.task_id} rejected — '
+                f'{self._task.task_id} still {self._task_state} '
+                f'(send CANCEL as first command to pre-empt)')
+            self._publish_status(msg.task_id, 'FAILED', 0, '', CMD_FAILED,
+                                 len(cmds), 0,
+                                 'controller busy; prepend CANCEL to pre-empt')
             return
 
-        cmds = sorted(msg.payloads, key=lambda c: c.sequence)
         ok, reason = self._validate(cmds)
         if not ok:
-            self.get_logger().error(f'Task {msg.task_id} ABORTED: {reason}')
-            self._publish_status(msg.task_id, 'ABORTED', 0, '', 'FAILED',
+            self.get_logger().error(f'Task {msg.task_id} REJECTED: {reason}')
+            self._publish_status(msg.task_id, 'FAILED', 0, '', CMD_FAILED,
                                  len(cmds), 0, reason)
             return
+
+        if is_cancel_task:
+            # Force hover regardless of whether a previous task was still
+            # running. PX4 can be left in OFFBOARD briefly after a task
+            # completes (setpoint timeout failsafe window), so always send
+            # an explicit LOITER when the operator says CANCEL.
+            self._cancel_running_task(
+                'pre-empted by new task' if busy else 'operator hover')
 
         self._task        = msg
         self._cmds        = cmds
@@ -293,11 +314,36 @@ class DroneControllerNode(Node):
                              len(cmds), 0)
 
     def _validate(self, cmds):
-        for cmd in cmds:
+        """
+        Sequence-aware validation. Walks the command list tracking the
+        expected in_air state after each step, rejecting transitions that
+        would be meaningless or impossible (e.g. TAKE_OFF while already
+        airborne, GO_TO without taking off first, LAND/RTH while landed).
+
+        CANCEL is accepted only as the first command; it does not change
+        the expected in_air state (drone keeps whatever altitude it had).
+        """
+        if not cmds:
+            return False, 'empty command list'
+
+        expected_in_air = not self._is_landed()
+
+        for i, cmd in enumerate(cmds):
             ct, pl, cid = cmd.command_type, cmd.payload, cmd.command_id
+
+            if ct == 'CANCEL':
+                if i != 0:
+                    return False, f'{cid}: CANCEL only allowed as first command'
+                continue
+
             if ct in ('TAKEOFF', 'TAKE_OFF'):
                 if not pl.has_altitude:
                     return False, f'{cid}: TAKE_OFF requires altitude'
+                if expected_in_air:
+                    return False, (f'{cid}: TAKE_OFF rejected — '
+                                   f'drone already airborne')
+                expected_in_air = True
+
             elif ct == 'GO_TO':
                 if not pl.has_position:
                     return False, f'{cid}: GO_TO requires latitude/longitude'
@@ -305,10 +351,45 @@ class DroneControllerNode(Node):
                     return False, f'{cid}: GO_TO requires altitude'
                 if pl.latitude == 0.0 and pl.longitude == 0.0:
                     return False, f'{cid}: GO_TO lat=0 lon=0 — invalid position'
-            elif ct not in ('PAUSE', 'CONTINUE', 'RETURN_TO_HOME',
-                            'LAND', 'ABORT'):
+                if not expected_in_air:
+                    return False, (f'{cid}: GO_TO rejected — '
+                                   f'drone not airborne (TAKE_OFF first)')
+
+            elif ct == 'LAND':
+                if not expected_in_air:
+                    return False, f'{cid}: LAND rejected — drone already landed'
+                expected_in_air = False
+
+            elif ct == 'RETURN_TO_HOME':
+                if not expected_in_air:
+                    return False, (f'{cid}: RETURN_TO_HOME rejected — '
+                                   f'drone not airborne')
+                expected_in_air = False
+
+            else:
                 return False, f'{cid}: unknown command_type="{ct}"'
+
         return True, ''
+
+    def _cancel_running_task(self, reason: str):
+        """Force the drone into hover and, if a task was actually running,
+        emit a CANCELED task_status for it. Safe to call when no task is
+        active (just sends LOITER). Caller installs the new task after."""
+        was_running = self._task_state == 'EXECUTING'
+        self._ob_active = False
+        if not self._is_landed():
+            self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
+                           p1=1.0, p2=4.0, p3=3.0)  # AUTO.LOITER
+        if was_running and self._task is not None:
+            cmd = self._cmds[self._cidx] if self._cidx < len(self._cmds) else None
+            self.get_logger().info(
+                f'⏹  Task {self._task.task_id} CANCELED — {reason}')
+            self._publish_status(
+                self._task.task_id, TASK_CANCELED,
+                cmd.sequence   if cmd else 0,
+                cmd.command_id if cmd else '',
+                CMD_CANCELED,
+                len(self._cmds), self._cidx, reason)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -319,12 +400,6 @@ class DroneControllerNode(Node):
         # out of OFFBOARD if setpoints stop for ~0.5 s).
         if self._ob_active:
             self._stream_offboard()
-
-        if self._task_state == 'PAUSED':
-            if self._cidx < len(self._cmds):
-                if self._cmds[self._cidx].command_type == 'CONTINUE':
-                    self._step()
-            return
 
         if self._task_state != 'EXECUTING':
             return
@@ -353,11 +428,9 @@ class DroneControllerNode(Node):
             'TAKEOFF':        self._exec_takeoff,
             'TAKE_OFF':       self._exec_takeoff,
             'GO_TO':          self._exec_go_to,
-            'PAUSE':          self._exec_pause,
-            'CONTINUE':       self._exec_continue,
             'RETURN_TO_HOME': self._exec_rth,
             'LAND':           self._exec_land,
-            'ABORT':          self._exec_abort_cmd,
+            'CANCEL':         self._exec_cancel,
         }
         done = dispatch[cmd.command_type](cmd)
         self._phase_cycle += 1
@@ -441,7 +514,7 @@ class DroneControllerNode(Node):
             if elapsed > ARM_TIMEOUT_S:
                 nav = self._vstatus.nav_state    if self._vstatus else '?'
                 arm = self._vstatus.arming_state if self._vstatus else '?'
-                self._abort_task(
+                self._fail_task(
                     f'TAKE_OFF arm timeout {ARM_TIMEOUT_S:.0f}s. '
                     f'nav_state={nav} arming_state={arm}. '
                     f'Check: GPS 3D fix, COM_RCL_EXCEPT, GCS heartbeat.')
@@ -592,34 +665,24 @@ class DroneControllerNode(Node):
             if dist <= arrival_r and alt_err <= ALT_TOLERANCE_M:
                 self.get_logger().info(
                     f'  GO_TO: arrived!  dist={dist:.2f} m  alt_err={alt_err:.2f} m')
-                # Stop offboard stream; PX4 falls back to position HOLD.
+                # Park PX4 in AUTO.LOITER before stopping the stream; otherwise
+                # PX4 stays in OFFBOARD, sees setpoints stop, and triggers the
+                # setpoint-timeout failsafe (~0.5 s → descent + land).
+                self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
+                               p1=1.0, p2=4.0, p3=3.0)
                 self._ob_active = False
                 return True
         return False
 
-    # ── PAUSE ─────────────────────────────────────────────────────────────────
+    # ── CANCEL ────────────────────────────────────────────────────────────────
 
-    def _exec_pause(self, cmd) -> bool:
-        if self._phase == Phase.WAITING_DATA:
-            self.get_logger().info(
-                '  PAUSE: switching to AUTO.LOITER (HOLD), awaiting CONTINUE')
-            self._ob_active = False
-            # main_mode=4 (AUTO), sub_mode=3 (LOITER) — PX4 holds position
-            self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
-                           p1=1.0, p2=4.0, p3=3.0)
-            self._task_state = 'PAUSED'
-            self._phase      = Phase.HOLDING
-            self._publish_status(
-                self._task.task_id, 'PAUSED',
-                cmd.sequence, cmd.command_id, CMD_RUNNING,
-                len(self._cmds), self._cidx)
-        return False
-
-    # ── CONTINUE ──────────────────────────────────────────────────────────────
-
-    def _exec_continue(self, cmd) -> bool:
-        self.get_logger().info('  CONTINUE: resuming')
-        self._task_state = 'EXECUTING'
+    def _exec_cancel(self, cmd) -> bool:
+        """First-command-only marker. The actual pre-emption (stopping the
+        previous task and putting the drone into LOITER) ran in
+        _cancel_running_task before this task was installed. Here we just
+        complete the CANCEL step so the dispatcher advances to the rest
+        of the new task."""
+        self.get_logger().info('  CANCEL: previous task pre-empted, hovering')
         return True
 
     # ── RTH ───────────────────────────────────────────────────────────────────
@@ -662,12 +725,6 @@ class DroneControllerNode(Node):
                 return True
         return False
 
-    # ── ABORT ─────────────────────────────────────────────────────────────────
-
-    def _exec_abort_cmd(self, cmd) -> bool:
-        self._abort_task(f'ABORT command ({cmd.command_id})')
-        return False
-
     # ── Task lifecycle ────────────────────────────────────────────────────────
 
     def _complete(self):
@@ -678,14 +735,15 @@ class DroneControllerNode(Node):
             self._task.task_id, 'COMPLETED', 0, '', CMD_COMPLETED,
             len(self._cmds), len(self._cmds))
 
-    def _abort_task(self, reason: str):
-        self._task_state = 'ABORTED'
+    def _fail_task(self, reason: str):
+        """Fail the running task in place (no auto-RTL). Operator must
+        decide next action via a new CANCEL or RETURN_TO_HOME task."""
+        self._task_state = 'FAILED'
         self._ob_active  = False
-        self.get_logger().error(f'🚨 ABORT: {reason}')
-        self._send_cmd(VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH)
+        self.get_logger().error(f'🚨 FAILED: {reason}')
         cmd = self._cmds[self._cidx] if self._cidx < len(self._cmds) else None
         self._publish_status(
-            self._task.task_id, 'ABORTED',
+            self._task.task_id, 'FAILED',
             cmd.sequence   if cmd else 0,
             cmd.command_id if cmd else '',
             CMD_FAILED,

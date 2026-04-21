@@ -30,7 +30,7 @@ def generate_launch_description():
         # Identity (mqtt_bridge_node)
         DeclareLaunchArgument('tenant_id',         default_value='Hanoi'),
         DeclareLaunchArgument('drone_id',           default_value='drone_01'),
-        DeclareLaunchArgument('drone_serial',       default_value='SN000001'),
+        DeclareLaunchArgument('drone_serial',       default_value='SN-000001'),
         # MQTT connection (mqtt_bridge_node)
         DeclareLaunchArgument('mqtt_host',          default_value='dev-lae-mqtt.viettelpost.vn'),
         DeclareLaunchArgument('mqtt_port',          default_value='443'),
