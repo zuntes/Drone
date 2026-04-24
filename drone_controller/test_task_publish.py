@@ -12,8 +12,8 @@ Subscribes to task_status to show progress back.
 Default broker:
   wss://dev-lae-mqtt.viettelpost.vn:443/mqtt   (EMQX via HAProxy)
 
-SITL home (PX4 Gazebo default, used by forward/backward tasks):
-  lat=37.41217321  lon=-121.99887844  alt_msl=38.175 m
+SITL home (matches Gazebo spherical_coordinates in default.sdf):
+  lat=21.276178  lon=105.898707  elevation=10.0 m  (Hanoi)
 
 Usage:
   # Individual tasks
@@ -22,6 +22,10 @@ Usage:
   python3 test_task_publish.py --task goto_home
   python3 test_task_publish.py --task rth
   python3 test_task_publish.py --task land
+
+  # Long-range tasks (require Gazebo ground plane >= 10 km x 10 km)
+  python3 test_task_publish.py --task goto_3km --wait 600
+  python3 test_task_publish.py --task goto_3km_and_land --wait 600
 
   # CANCEL pre-emption
   python3 test_task_publish.py --task cancel_only
@@ -58,13 +62,17 @@ except ImportError:
     print('[ERROR] pip install paho-mqtt')
     sys.exit(1)
 
-# ── SITL home ────────────────────────────────────────────────────────────────
-HOME_LAT = 37.412173210128394
-HOME_LON = -121.99887844299644
+# ── SITL home (matches Gazebo spherical_coordinates in default.sdf) ──────────
+HOME_LAT = 21.276178
+HOME_LON = 105.898707
 
 FORWARD_M = 50.0
 NORTH_LAT = HOME_LAT + math.degrees(FORWARD_M / 6_371_000.0)
 NORTH_LON = HOME_LON  # due north
+
+LONG_FORWARD_M = 1200.0
+LONG_NORTH_LAT = HOME_LAT + math.degrees(LONG_FORWARD_M / 6_371_000.0)
+LONG_NORTH_LON = HOME_LON  # due north
 
 # ── Default broker (EMQX via HAProxy) ────────────────────────────────────────
 DEFAULT_HOST      = 'dev-lae-mqtt.viettelpost.vn'
@@ -189,6 +197,7 @@ def task_goto_north(cfg):
 def task_goto_home(cfg):
     tid = 'TASK_GOTO_HOME_001'
     print(f'\n[Task] GO_TO home  (expects drone already airborne)')
+    print(f'       target: {HOME_LAT:.6f}, {HOME_LON:.6f}')
     return tid, [
         goto(1, tid, HOME_LAT, HOME_LON, 30.0, speed=5.0),
     ]
@@ -203,6 +212,7 @@ def task_cancel_only(cfg):
 def task_cancel_then_goto_home(cfg):
     tid = 'TASK_CANCEL_GOTO_001'
     print(f'\n[Task] CANCEL → GO_TO home  (pre-empt then fly home)')
+    print(f'       home: {HOME_LAT:.6f}, {HOME_LON:.6f}')
     return tid, [
         cancel(1, tid),
         goto(2, tid, HOME_LAT, HOME_LON, 30.0, speed=5.0),
@@ -225,11 +235,35 @@ def task_combined(cfg):
     tid = 'TASK_COMBINED_001'
     print(f'\n[Task] COMBINED: TAKE_OFF → GO_TO north → GO_TO home → RTH')
     print(f'       north target: {NORTH_LAT:.6f}, {NORTH_LON:.6f}')
+    print(f'       home: {HOME_LAT:.6f}, {HOME_LON:.6f}')
     return tid, [
         takeoff(1, tid, 40.0),
         goto(2, tid, NORTH_LAT, NORTH_LON, 40.0, speed=6.0),
         goto(3, tid, HOME_LAT, HOME_LON, 40.0, speed=6.0),
         rth(4, tid, alt_m=50.0, speed=5.0),
+    ]
+
+
+def task_goto_3km(cfg):
+    tid = 'TASK_GOTO_3km_001'
+    print(f'\n[Task] TAKE_OFF 40 m → GO_TO {LONG_FORWARD_M:.0f} m north')
+    print(f'       target: {LONG_NORTH_LAT:.6f}, {LONG_NORTH_LON:.6f}')
+    print(f'       WARNING: requires Gazebo ground plane >= 10 km x 10 km')
+    return tid, [
+        takeoff(1, tid, 40.0),
+        goto(2, tid, LONG_NORTH_LAT, LONG_NORTH_LON, 40.0, speed=10.0),
+    ]
+
+
+def task_goto_3km_and_land(cfg):
+    tid = 'TASK_GOTO_3km_LAND_001'
+    print(f'\n[Task] TAKE_OFF 40 m → GO_TO 4 km north → LAND')
+    print(f'       target: {LONG_NORTH_LAT:.6f}, {LONG_NORTH_LON:.6f}')
+    print(f'       WARNING: requires Gazebo ground plane >= 10 km x 10 km')
+    return tid, [
+        takeoff(1, tid, 40.0),
+        goto(2, tid, LONG_NORTH_LAT, LONG_NORTH_LON, 40.0, speed=10.0),
+        land(3, tid),
     ]
 
 
@@ -274,6 +308,8 @@ TASKS = {
     'rth':                    task_rth,
     'land':                   task_land,
     'combined':               task_combined,
+    'goto_3km':               task_goto_3km,
+    'goto_3km_and_land':      task_goto_3km_and_land,
     'error_no_altitude':      task_error_no_altitude,
     'error_wrong_tenant':     task_error_wrong_tenant,
     'error_wrong_serial':     task_error_wrong_serial,
