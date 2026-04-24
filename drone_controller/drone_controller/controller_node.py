@@ -481,6 +481,12 @@ class DroneControllerNode(Node):
             self._takeoff_target_alt_m = target_alt
             alt_amsl = self._get_home_amsl() + target_alt
 
+            # Per-command climb speed: DO_CHANGE_SPEED type=2 (CLIMB_SPEED)
+            # must be sent BEFORE NAV_TAKEOFF so PX4's AUTO.TAKEOFF uses it.
+            if cmd.payload.has_speed:
+                self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_CHANGE_SPEED,
+                               p1=2.0, p2=float(cmd.payload.speed_ms), p3=-1.0)
+
             # NAV_TAKEOFF must be sent BEFORE arming so PX4 switches to
             # AUTO.TAKEOFF mode; otherwise ARM is rejected by the preflight
             # check in non-manual modes.
@@ -621,6 +627,13 @@ class DroneControllerNode(Node):
             self._goto_speed    = speed
             self._goto_arrival  = arrival_r
             self._ob_target_ned = [n, e, d]
+
+            # Per-command cruise speed for OFFBOARD position-setpoint flight.
+            # DO_CHANGE_SPEED type=1 (GROUNDSPEED) overrides MPC_XY_CRUISE for
+            # this leg so each GO_TO honors its own speed_ms.
+            if pl.has_speed:
+                self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_CHANGE_SPEED,
+                               p1=1.0, p2=float(speed), p3=-1.0)
             # Yaw towards target (heading from current NED position).
             dn = n - float(self._lpos.x)
             de = e - float(self._lpos.y)
@@ -691,6 +704,9 @@ class DroneControllerNode(Node):
         if self._phase == Phase.WAITING_DATA:
             self.get_logger().info('  RTH: Return-to-Launch')
             self._ob_active = False
+            if cmd.payload.has_speed:
+                self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_CHANGE_SPEED,
+                               p1=1.0, p2=float(cmd.payload.speed_ms), p3=-1.0)
             self._send_cmd(VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH)
             self._phase = Phase.WAITING
             return False
@@ -711,6 +727,10 @@ class DroneControllerNode(Node):
         if self._phase == Phase.WAITING_DATA:
             self.get_logger().info('  LAND: NAV_LAND')
             self._ob_active = False
+            # Per-command descent speed: type=3 (DESCEND_SPEED) before NAV_LAND.
+            if cmd.payload.has_speed:
+                self._send_cmd(VehicleCommand.VEHICLE_CMD_DO_CHANGE_SPEED,
+                               p1=3.0, p2=float(cmd.payload.speed_ms), p3=-1.0)
             self._send_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
             self._phase = Phase.WAITING
             return False
