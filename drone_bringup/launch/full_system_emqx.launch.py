@@ -1,20 +1,4 @@
-"""
-Full system launch — starts both telemetry_node and mqtt_bridge_node.
-
-Usage:
-  ros2 launch bringup full_system.launch.py
-
-Override individual params:
-  ros2 launch bringup full_system.launch.py \
-    mqtt_host:=100.104.34.77 \
-    tenant_id:=Hanoi \
-    drone_id:=drone_01 \
-    drone_serial:=SN000001
-
-The two nodes are independent:
-  - telemetry_node crash → mqtt_bridge keeps running (MQTT stays connected)
-  - mqtt_bridge crash    → telemetry_node keeps running (PX4 data still flows in ROS2)
-"""
+""" Full system launch — starts both telemetry_node and mqtt_bridge_node."""
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
