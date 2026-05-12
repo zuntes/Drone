@@ -12,6 +12,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch',
             ['launch/controller.launch.py']),
+        ('share/' + package_name + '/launch',
+            ['launch/controller_sim.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
