@@ -57,7 +57,6 @@ from px4_msgs.msg import (
     VehicleLandDetected, VehicleGlobalPosition,
 )
 from drone_msgs.msg import TaskCommand, TaskStatus
-from std_msgs.msg import Bool
 
 # ── Tunable ───────────────────────────────────────────────────────────────────
 CONTROL_HZ          = 20.0
@@ -178,16 +177,11 @@ class DroneControllerNode(Node):
         self.create_subscription(
             TaskCommand, '/mqtt_bridge/out/task_command',
             self._on_task_command, ros_qos)
-        self.create_subscription(
-            Bool, '/gcs/armed',
-            lambda m: setattr(self, '_gcs_alive', True), 10)
-
         # ── Vehicle state ─────────────────────────────────────────────────
         self._vstatus   = None
         self._lpos      = None
         self._gpos      = None
         self._landed    = True
-        self._gcs_alive = False
 
         # ── Task state ────────────────────────────────────────────────────
         self._task        = None
@@ -383,7 +377,7 @@ class DroneControllerNode(Node):
         if was_running and self._task is not None:
             cmd = self._cmds[self._cidx] if self._cidx < len(self._cmds) else None
             self.get_logger().info(
-                f'⏹  Task {self._task.task_id} CANCELED — {reason}')
+                f'  Task {self._task.task_id} CANCELED — {reason}')
             self._publish_status(
                 self._task.task_id, TASK_CANCELED,
                 cmd.sequence   if cmd else 0,
@@ -462,18 +456,11 @@ class DroneControllerNode(Node):
             if self._lpos is None:
                 if self._phase_cycle % int(CONTROL_HZ * 2) == 0:
                     self.get_logger().warn(
-                        '  TAKE_OFF: waiting for local position '
-                        '(is DDS agent running? ROS_LOCALHOST_ONLY=1 set?)')
+                        '  TAKE_OFF: waiting for local position ')
                 ready = False
             if self._gpos is None:
                 if self._phase_cycle % int(CONTROL_HZ * 2) == 0:
                     self.get_logger().warn('  TAKE_OFF: waiting for global position (GPS fix)')
-                ready = False
-            if not self._gcs_alive:
-                if self._phase_cycle % int(CONTROL_HZ * 2) == 0:
-                    self.get_logger().warn(
-                        '  TAKE_OFF: waiting for GCS heartbeat '
-                        '(gcs_heartbeat_node must be running and connected)')
                 ready = False
             if not ready:
                 return False
@@ -760,7 +747,7 @@ class DroneControllerNode(Node):
         decide next action via a new CANCEL or RETURN_TO_HOME task."""
         self._task_state = 'FAILED'
         self._ob_active  = False
-        self.get_logger().error(f'🚨 FAILED: {reason}')
+        self.get_logger().error(f' FAILED: {reason}')
         cmd = self._cmds[self._cidx] if self._cidx < len(self._cmds) else None
         self._publish_status(
             self._task.task_id, 'FAILED',
