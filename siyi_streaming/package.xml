@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>siyi_streaming</name>
+  <version>1.0.0</version>
+  <description>MediaMTX-based video streaming for the SIYI A8 mini gimbal:
+  RTSP relay, browser-playable HLS, and optional public exposure via
+  Tailscale Funnel. Single package — config, install script, launch file,
+  and viewer page all in one.</description>
+  <maintainer email="dev@vtp.vn">VTP Robotics</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- MediaMTX itself is a single Go binary installed by scripts/install_mediamtx.sh.
+       No ROS2 message/service deps because the launch is the entire surface. -->
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

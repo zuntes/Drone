@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIYI gimbal — live</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd;
+               font: 14px/1.4 -apple-system, system-ui, sans-serif; }
+  #stage  { position: fixed; inset: 0; display: grid; place-items: center; }
+  video   { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #hud    { position: fixed; top: 12px; left: 12px; padding: 6px 10px;
+            background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.15);
+            border-radius: 6px; pointer-events: none; }
+  #hud .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+              background: #888; margin-right: 6px; vertical-align: middle; }
+  #hud.live  .dot { background: #2bb673; box-shadow: 0 0 8px #2bb673; }
+  #hud.error .dot { background: #d04040; }
+  #help   { position: fixed; bottom: 12px; left: 12px;
+            color: #888; font-size: 12px; }
+  #help code { color: #ccc; background: rgba(255,255,255,.08);
+               padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+  <!--
+    Single-file HLS viewer for the SIYI gimbal stream.
+
+    URL params:
+      ?stream=main                   pick the path slug (default: main)
+      ?base=https://other-host       point at a different host (default: same origin)
+
+    Examples:
+      Open through Tailscale Funnel and stream "main":
+        https://<jetson>.<tailnet>.ts.net/viewer.html
+      Local LAN dev:
+        http://localhost:8888/viewer.html?base=http://localhost:8888
+  -->
+  <div id="stage"><video id="v" autoplay muted playsinline controls></video></div>
+  <div id="hud"><span class="dot"></span><span id="state">Connecting…</span></div>
+  <div id="help">
+    Source: <code id="src">…</code> · Latency: ~1.5–3 s on public link.
+  </div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js"></script>
+<script>
+(() => {
+  const qs   = new URLSearchParams(location.search);
+  const name = qs.get('stream') || 'main';
+  const base = qs.get('base')   || location.origin;
+  const url  = `${base}/${name}/index.m3u8`;
+
+  const v       = document.getElementById('v');
+  const hud     = document.getElementById('hud');
+  const stateEl = document.getElementById('state');
+  document.getElementById('src').textContent = url;
+
+  const setState = (msg, cls = '') => {
+    stateEl.textContent = msg;
+    hud.className = cls;
+  };
+
+  const native = v.canPlayType('application/vnd.apple.mpegurl') !== '';
+
+  if (native) {
+    v.src = url;
+    v.addEventListener('playing', () => setState('Live (native HLS)', 'live'));
+    v.addEventListener('error',   () => setState('Stream error',     'error'));
+    v.addEventListener('waiting', () => setState('Buffering…'));
+  } else if (window.Hls && Hls.isSupported()) {
+    const hls = new Hls({
+      // Tuned for low-latency HLS. Keep in sync with config/mediamtx.yml.
+      lowLatencyMode: true,
+      backBufferLength: 8,
+      maxBufferLength: 6,
+      liveSyncDuration: 1.5,
+      liveMaxLatencyDuration: 4,
+    });
+    hls.loadSource(url);
+    hls.attachMedia(v);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
+    hls.on(Hls.Events.FRAG_LOADED,    () => setState('Live (hls.js)', 'live'));
+    hls.on(Hls.Events.ERROR, (_, data) => {
+      if (!data.fatal) return;
+      setState(`Error: ${data.type}. Retrying…`, 'error');
+      switch (data.type) {
+        case Hls.ErrorTypes.NETWORK_ERROR: hls.startLoad();        break;
+        case Hls.ErrorTypes.MEDIA_ERROR:   hls.recoverMediaError(); break;
+        default: setTimeout(() => location.reload(), 2000);
+      }
+    });
+  } else {
+    setState('No HLS support in this browser.', 'error');
+  }
+
+  v.addEventListener('click', () => { v.muted = !v.muted; });
+})();
+</script>
+</body>
+</html>

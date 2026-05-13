@@ -1,0 +1,70 @@
+logLevel: info
+
+api: yes
+apiAddress: 127.0.0.1:9997
+
+###############################################################################
+# RTSP
+###############################################################################
+
+rtspAddress: :8554
+rtspTransports: [tcp]
+
+###############################################################################
+# HLS
+###############################################################################
+
+hls: yes
+hlsAddress: :8888
+
+hlsAlwaysRemux: yes
+hlsVariant: lowLatency
+
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+
+# Slightly larger to satisfy iOS LL-HLS requirements
+hlsPartDuration: 250ms
+
+hlsAllowOrigins: ['*']
+
+###############################################################################
+# WebRTC
+###############################################################################
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+webrtcIPsFromInterfaces: yes
+
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+
+###############################################################################
+# Disable unused protocols
+###############################################################################
+
+rtmp: no
+srt: no
+
+###############################################################################
+# Default path behavior
+###############################################################################
+
+pathDefaults:
+  sourceOnDemand: no
+
+###############################################################################
+# Streams
+###############################################################################
+
+paths:
+
+  main:
+    source: rtsp://192.168.144.25:8554/main.264
+
+    # Modern key name
+    rtspTransport: tcp
+
+  all_others:
+    source: publisher
